@@ -20,7 +20,10 @@ from sglang_omni.models.fishaudio_s2_pro.request_builders import (
     S2ProSGLangRequestData,
     validate_s2pro_top_k,
 )
-from sglang_omni.models.fishaudio_s2_pro.sglang_model import S2ProSGLangTextModel
+from sglang_omni.models.fishaudio_s2_pro.sglang_model import (
+    S2ProSGLangTextModel,
+    _decode_codebook_loop_impl,
+)
 from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.scheduling.types import (
     ModelRunnerOutput,
@@ -458,6 +461,17 @@ def test_fish_s2pro_setup_vq_decode_allocates_sampling_state() -> None:
     assert model._ras_top_p.shape == (3,)
     assert model._rep_positions.tolist() == [0, 1, 2, 3, 4]
     assert model._top_k_positions.shape == (30,)
+    assert (
+        S2ProSGLangTextModel.get_compile_targets(model)["decode_codebook_loop"]
+        is model._decode_codebook_loop_fn
+    )
+
+    def compiled_fn(hidden_states, semantic_token):
+        del hidden_states, semantic_token
+        return torch.empty(0)
+
+    S2ProSGLangTextModel.set_compiled_decode_codebook_loop_fn(model, compiled_fn)
+    assert model._decode_codebook_loop_fn is compiled_fn
     assert model._vq_ready
 
 
@@ -509,6 +523,22 @@ def test_fish_s2pro_decode_codebooks_keeps_eos_out_of_audio_embedding() -> None:
         _output_codes=torch.zeros(1, 3, dtype=torch.long),
         _output_semantic_ids=torch.zeros(1, dtype=torch.long),
     )
+
+    def decode_codebook_loop_fn(
+        hidden_states: torch.Tensor,
+        semantic_token: torch.Tensor,
+    ) -> torch.Tensor:
+        return _decode_codebook_loop_impl(
+            hidden_states,
+            semantic_token,
+            audio_decoder=audio_decoder,
+            codebook_size=model._codebook_size,
+            num_codebooks=model._num_codebooks,
+            semantic_begin_id=model._semantic_begin_id,
+            im_end_token_id=model._im_end_token_id,
+        )
+
+    model._decode_codebook_loop_fn = decode_codebook_loop_fn
     model._semantic_bias[10:18] = 0.0
     model._semantic_bias[30] = 0.0
     logits = torch.full((1, 40), -1_000_000.0)

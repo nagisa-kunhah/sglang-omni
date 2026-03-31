@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 
+from sglang_omni.config.manager import ConfigManager
 from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
 from sglang_omni.models.fishaudio_s2_pro.payload_types import S2ProState
 from sglang_omni.models.fishaudio_s2_pro.request_builders import (
@@ -22,6 +25,8 @@ from tests.unit_test.fixtures.fish_fakes import (
     make_s2pro_payload,
     make_s2pro_state,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.fixture(autouse=True)
@@ -79,6 +84,20 @@ def test_fish_config_state_and_tokenizer_prompt_contracts() -> None:
     assert prompt["vq_mask_tokens"].sum().item() == 2
     assert torch.equal(prompt["vq_parts"][0], torch.tensor([[0, 1], [10, 11]]))
     assert any("<|speaker:alice|>target" in text for text in tokenizer.encoded_texts)
+
+
+def test_fish_compile_example_config_targets_current_stage_factory() -> None:
+    manager = ConfigManager.from_file(
+        str(_REPO_ROOT / "examples" / "configs" / "s2pro_tts_compile.yaml")
+    )
+    config = manager.config
+    tts_stage = next(stage for stage in config.stages if stage.name == "tts_engine")
+
+    assert config.runtime_overrides["tts_engine"]["compile_level"] == "partial"
+    assert tts_stage.factory == (
+        "sglang_omni.models.fishaudio_s2_pro.stages."
+        "create_sglang_tts_engine_executor"
+    )
 
 
 def test_fish_tts_request_and_result_adapters_preserve_tensor_contracts() -> None:

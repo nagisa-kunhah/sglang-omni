@@ -161,6 +161,7 @@ def create_sglang_tts_engine_executor(
     max_new_tokens: int = 2048,
     top_k: int = 30,
     ras_window: int = 16,
+    compile_level: str = "none",
     server_args_overrides: dict[str, Any] | None = None,
 ):
     """Returns OmniScheduler for the Fish TTS AR engine."""
@@ -181,6 +182,9 @@ def create_sglang_tts_engine_executor(
 
     checkpoint_dir = _resolve_checkpoint(model_path)
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
+    compile_level = str(compile_level).strip().lower()
+    if compile_level not in {"none", "partial"}:
+        raise ValueError("compile_level must be 'none' or 'partial'")
 
     patch_fish_config_for_sglang()
 
@@ -239,6 +243,16 @@ def create_sglang_tts_engine_executor(
         codebook_size=codebook_size,
         ras_window=ras_window,
     )
+
+    if compile_level == "partial" or bool(
+        getattr(server_args, "enable_torch_compile", False)
+    ):
+        from sglang_omni.engines.omni.compile import apply_compile_targets
+
+        compiled = apply_compile_targets(model_worker.model_runner.model)
+        logger.info("Fish S2-Pro torch.compile targets: %s", compiled)
+        if hasattr(server_args, "enable_torch_compile"):
+            server_args.enable_torch_compile = False
 
     if want_cuda_graph:
         model_worker.model_runner.init_device_graphs()

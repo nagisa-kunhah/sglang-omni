@@ -1,0 +1,6 @@
+config_cls: S2ProPipelineConfig
+model_path: fishaudio/s2-pro
+relay_backend: shm
+runtime_overrides:
+  tts_engine:
+    compile_level: partial

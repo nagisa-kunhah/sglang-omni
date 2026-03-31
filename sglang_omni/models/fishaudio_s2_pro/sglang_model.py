@@ -4,9 +4,10 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Callable, Iterable, Optional, Tuple
 
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -33,6 +34,41 @@ _GRAPH_TOP_K = 30
 _DEFAULT_TEMPERATURE = 0.8
 _DEFAULT_TOP_P = 0.8
 _DEFAULT_REP_PENALTY = 1.1
+
+
+def _decode_codebook_loop_impl(
+    hidden_states: Tensor,
+    semantic_token: Tensor,
+    *,
+    audio_decoder: nn.Module,
+    codebook_size: int,
+    num_codebooks: int,
+    semantic_begin_id: int,
+    im_end_token_id: int,
+) -> Tensor:
+    """Generate S2-Pro residual codebooks for sampled semantic tokens."""
+    audio_decoder.reset_caches()
+    fast_input = audio_decoder.project_in(hidden_states)
+    fast_input = fast_input.unsqueeze(1)
+    audio_decoder.forward_kvcached(fast_input, codebook_idx=0)
+
+    is_eos = semantic_token == im_end_token_id
+    sem_id = (semantic_token - semantic_begin_id).clamp(
+        min=0,
+        max=codebook_size - 1,
+    )
+    sem_id = torch.where(is_eos, torch.zeros_like(sem_id), sem_id)
+    cb_hidden = audio_decoder.embeddings(sem_id).unsqueeze(1)
+
+    codes = [semantic_token, sem_id]
+    for cb_idx in range(1, num_codebooks):
+        cb_logits = audio_decoder.forward_kvcached(cb_hidden, codebook_idx=cb_idx)
+        cb_logits = cb_logits[:, 0, :codebook_size]
+        cb_token = torch.argmax(cb_logits, dim=-1)
+        cb_hidden = audio_decoder.embeddings(cb_token).unsqueeze(1)
+        codes.append(cb_token)
+
+    return torch.stack(codes, dim=1)
 
 
 class S2ProAttention(nn.Module):
@@ -312,6 +348,14 @@ class S2ProSGLangTextModel(nn.Module):
         self._rep_positions = torch.arange(rep_history_len, device=device)
         self._top_k_positions = torch.arange(_GRAPH_TOP_K, device=device)
         self._ras_range = torch.arange(4, 0, -1, device=device)
+        self._decode_codebook_loop_fn = functools.partial(
+            _decode_codebook_loop_impl,
+            audio_decoder=self._audio_decoder,
+            codebook_size=self._codebook_size,
+            num_codebooks=self._num_codebooks,
+            semantic_begin_id=self._semantic_begin_id,
+            im_end_token_id=self._im_end_token_id,
+        )
 
         self._vq_ready = True
 
@@ -371,6 +415,14 @@ class S2ProSGLangTextModel(nn.Module):
             next_token_logits=logits,
             hidden_states=hidden_states,
         )
+
+    def get_compile_targets(self) -> dict[str, Callable]:
+        if not self._vq_ready:
+            return {}
+        return {"decode_codebook_loop": self._decode_codebook_loop_fn}
+
+    def set_compiled_decode_codebook_loop_fn(self, compiled_fn: Callable) -> None:
+        self._decode_codebook_loop_fn = compiled_fn
 
     @torch.no_grad()
     def _decode_codebooks(self, logits: Tensor, hidden_states: Tensor) -> None:
@@ -432,32 +484,10 @@ class S2ProSGLangTextModel(nn.Module):
             -1, torch.multinomial(probs, num_samples=1)
         ).squeeze(-1)
 
-        # Batched codebook loop
-        self._audio_decoder.reset_caches()
-        fast_input = self._audio_decoder.project_in(hidden_states)
-        fast_input = fast_input.unsqueeze(1)  # [bs, 1, fast_dim]
-        self._audio_decoder.forward_kvcached(fast_input, codebook_idx=0)
-
-        is_eos = semantic_token == self._im_end_token_id
-        sem_id = (semantic_token - self._semantic_begin_id).clamp(
-            min=0,
-            max=self._codebook_size - 1,
+        self._output_codes[:bs] = self._decode_codebook_loop_fn(
+            hidden_states,
+            semantic_token,
         )
-        sem_id = torch.where(is_eos, torch.zeros_like(sem_id), sem_id)
-        cb_hidden = self._audio_decoder.embeddings(sem_id).unsqueeze(1)
-
-        self._output_codes[:bs, 0] = semantic_token
-        self._output_codes[:bs, 1] = sem_id
-
-        for cb_idx in range(1, self._num_codebooks):
-            cb_logits = self._audio_decoder.forward_kvcached(
-                cb_hidden, codebook_idx=cb_idx
-            )
-            cb_logits = cb_logits[:, 0, : self._codebook_size]
-            cb_token = torch.argmax(cb_logits, dim=-1)  # [bs]
-            cb_hidden = self._audio_decoder.embeddings(cb_token).unsqueeze(1)
-            self._output_codes[:bs, cb_idx + 1] = cb_token
-
         self._output_semantic_ids[:bs] = semantic_token
 
     def get_embed_tokens(self):
