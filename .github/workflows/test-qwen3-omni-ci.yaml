@@ -24,8 +24,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - uses: ./.github/actions/qwen3-omni-setup
+      - uses: ./.github/actions/omni-setup
         with:
+          venv-name: omni-qwen3
+          pip-extras: dev
           install-deps: "true"
 
       - name: Run docs tests
@@ -66,7 +68,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - uses: ./.github/actions/qwen3-omni-setup
+      - uses: ./.github/actions/omni-setup
+        with:
+          venv-name: omni-qwen3
 
       - name: Run TTS CI (speed + WER)
         shell: bash
@@ -107,7 +111,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - uses: ./.github/actions/qwen3-omni-setup
+      - uses: ./.github/actions/omni-setup
+        with:
+          venv-name: omni-qwen3
 
       - name: Run MMMU CI (accuracy + speed)
         shell: bash
@@ -147,7 +153,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - uses: ./.github/actions/qwen3-omni-setup
+      - uses: ./.github/actions/omni-setup
+        with:
+          venv-name: omni-qwen3
 
       - name: Run MMMU TTS Consistency CI (WER + speed)
         shell: bash
