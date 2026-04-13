@@ -44,6 +44,7 @@ runs:
         if [ -n "${PIP_EXTRAS}" ]; then
           uv pip install -v -e ".[${PIP_EXTRAS}]"
         else
+          echo "::warning::pip-extras is empty; installing bare package without extras"
           uv pip install -v -e .
         fi
         # Repair PyAV if its bundled shared libs got corrupted in the cached
