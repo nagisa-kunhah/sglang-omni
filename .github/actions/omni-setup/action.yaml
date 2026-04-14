@@ -65,7 +65,10 @@ runs:
           echo "Prepared ${VENV_NAME} environment is missing. Run the setup stage first."
           exit 1
         }
-        "${VENV_NAME}/bin/python" -c "import torch"
+        "${VENV_NAME}/bin/python" -c "import torch" 2>/dev/null || {
+          echo "Cached venv is corrupted (torch not importable). Re-run the setup stage."
+          exit 1
+        }
 
     - name: Remove flashinfer
       shell: bash
