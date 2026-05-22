@@ -58,7 +58,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="May 07, 2026"/>
+    <meta name="docbuild:last-update" content="May 22, 2026"/>
   </head>
   
   
@@ -159,6 +159,7 @@
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Omni Model Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tts_s2pro.html">TTS Model Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="omni_router.html">Omni Router Usage</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
 <ul class="nav bd-sidenav">
@@ -166,8 +167,11 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Reference</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../developer_reference/architecture.html">Architecture</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer_reference/relay_design.html">Relay</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/main.html">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/apiserver_design.html">API Server Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/pipeline.html">Pipeline Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/config.html">Config</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/communication.html">Communication</a></li>
 </ul>
 
     </div>
@@ -432,7 +436,7 @@ docker<span class="w"> </span>run<span class="w"> </span>-it<span class="w"> </s
 </div>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/sgl-project/sglang-omni.git
 <span class="nb">cd</span><span class="w"> </span>sglang-omni
-uv<span class="w"> </span>venv<span class="w"> </span>.venv<span class="w"> </span>-p<span class="w"> </span><span class="m">3</span>.13<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">source</span><span class="w"> </span>.venv/bin/activate
+uv<span class="w"> </span>venv<span class="w"> </span>.venv<span class="w"> </span>-p<span class="w"> </span><span class="m">3</span>.12<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">source</span><span class="w"> </span>.venv/bin/activate
 uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-v<span class="w"> </span>.
 </pre></div>
 </div>
@@ -567,7 +571,15 @@ instructions in the text message.</p>
 <p>Speech mode runs the full 9-stage pipeline across multiple GPUs. It produces both text (from the thinker) and audio (from the talker) output.</p>
 <section id="id1">
 <h3>Launch the Server<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
-<p>Speech mode requires multiple GPUs. Use the example script with GPU placement control:</p>
+<p>Speech mode can run as a colocated one-GPU worker using the colocated config:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3-Omni-30B-A3B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/qwen3_omni_colocated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--colocate<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
+</pre></div>
+</div>
+<p>For manual multi-GPU placement, use the example script:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/run_qwen3_omni_speech_server.py<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3-Omni-30B-A3B-Instruct<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--gpu-thinker<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
@@ -577,7 +589,7 @@ instructions in the text message.</p>
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
 </pre></div>
 </div>
-<p>Or use the CLI without <code class="docutils literal notranslate"><span class="pre">--text-only</span></code> (defaults to speech mode):</p>
+<p>Or use the CLI without <code class="docutils literal notranslate"><span class="pre">--text-only</span></code> for the standard speech pipeline:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3-Omni-30B-A3B-Instruct<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
@@ -933,7 +945,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on May 07, 2026.
+  Last updated on May 22, 2026.
   <br/>
 </p>
   </div>
