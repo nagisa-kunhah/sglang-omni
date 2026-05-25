@@ -23,6 +23,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "try_resolve_arch_from_raw_config",
     ),
     "import_string": ("sglang_omni.utils.imports", "import_string"),
+    "LruCache": ("sglang_omni.utils.lru_cache", "LruCache"),
     "get_layer_id": ("sglang_omni.utils.misc", "get_layer_id"),
     "add_prefix": ("sglang_omni.utils.misc", "add_prefix"),
     "set_random_seed": ("sglang_omni.utils.misc", "set_random_seed"),

@@ -4,11 +4,209 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang_omni.config import resolve_stage_factory_args
 from sglang_omni.models.higgs_tts import stages
+from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.utils import EOC_ID
 from sglang_omni.proto import OmniRequest, StagePayload
+
+
+class _CaptureScheduler:
+    def __init__(self, compute_fn, **kwargs) -> None:
+        self.compute_fn = compute_fn
+        self.kwargs = kwargs
+
+
+class _FakeTokenizer:
+    @staticmethod
+    def from_file(_path):
+        return object()
+
+
+class _FakeTokenizerAdapter:
+    def __init__(self, _tokenizer) -> None:
+        pass
+
+    def build_prompt(
+        self,
+        text: str,
+        *,
+        num_ref_tokens: int,
+        reference_text: str | None = None,
+    ) -> list[int]:
+        ref_len = len(reference_text or "")
+        return [len(text), num_ref_tokens, ref_len]
+
+
+class _FakeCodec:
+    def __init__(self) -> None:
+        self.calls: list[torch.Tensor] = []
+
+    def encode_reference(self, waveform: torch.Tensor, *, sample_rate: int):
+        self.calls.append(waveform.clone())
+        base = int(waveform.flatten()[0].item())
+        return torch.tensor(
+            [[base, base + 1], [base + 2, base + 3]],
+            dtype=torch.long,
+        )
+
+
+def _install_audio_encoder_fakes(monkeypatch, codec: _FakeCodec) -> None:
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(stages, "Tokenizer", _FakeTokenizer)
+    monkeypatch.setattr(
+        stages, "PreTrainedTokenizerFast", lambda tokenizer_object: object()
+    )
+    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", _FakeTokenizerAdapter)
+    monkeypatch.setattr(stages, "get_or_load_codec", lambda *_args: codec)
+    monkeypatch.setattr(stages, "SimpleScheduler", _CaptureScheduler)
+
+
+def _audio_encoder_compute_fn(
+    monkeypatch,
+    *,
+    codec: _FakeCodec | None = None,
+    reference_audio_cache_size: int = 128,
+):
+    codec = codec or _FakeCodec()
+    _install_audio_encoder_fakes(monkeypatch, codec)
+    scheduler = stages.create_audio_encoder_executor(
+        "dummy-model",
+        device="cpu",
+        num_codebooks=2,
+        reference_audio_cache_size=reference_audio_cache_size,
+    )
+    return scheduler.compute_fn, codec
+
+
+def _payload(
+    waveform: torch.Tensor | None,
+    *,
+    text: str = "hello",
+    reference_text: str | None = "speaker",
+    reference_codes_delayed: list[list[int]] | None = None,
+) -> StagePayload:
+    state = HiggsTtsState(
+        prompt_token_ids=[99],
+        reference_codes_delayed=reference_codes_delayed,
+        reference_waveform=waveform,
+        target_text=text,
+        reference_text=reference_text,
+        num_codebooks=2,
+    )
+    return StagePayload(
+        request_id="req",
+        request=OmniRequest(inputs={}),
+        data=state.to_dict(),
+    )
+
+
+def _waveform(first_value: int) -> torch.Tensor:
+    return torch.tensor([[[float(first_value), 0.0, 1.0]]], dtype=torch.float32)
+
+
+def test_higgs_audio_encoder_caches_same_reference_audio(monkeypatch) -> None:
+    compute_fn, codec = _audio_encoder_compute_fn(monkeypatch)
+
+    first = compute_fn(_payload(_waveform(10), text="alpha"))
+    second = compute_fn(_payload(_waveform(10), text="bravo!"))
+
+    assert len(codec.calls) == 1
+    assert (
+        first.data["reference_codes_delayed"]
+        == second.data["reference_codes_delayed"]
+    )
+    assert first.data["prompt_token_ids"] != second.data["prompt_token_ids"]
+    for data in (first.data, second.data):
+        assert "reference_waveform" not in data
+        assert "target_text" not in data
+        assert "reference_text" not in data
+
+
+def test_higgs_audio_encoder_cache_key_uses_waveform_content(monkeypatch) -> None:
+    compute_fn, codec = _audio_encoder_compute_fn(monkeypatch)
+
+    first = compute_fn(_payload(_waveform(10)))
+    second = compute_fn(_payload(_waveform(20)))
+
+    assert len(codec.calls) == 2
+    assert (
+        first.data["reference_codes_delayed"]
+        != second.data["reference_codes_delayed"]
+    )
+
+
+def test_higgs_audio_encoder_cache_size_zero_disables_cache(monkeypatch) -> None:
+    compute_fn, codec = _audio_encoder_compute_fn(
+        monkeypatch,
+        reference_audio_cache_size=0,
+    )
+
+    first = compute_fn(_payload(_waveform(10)))
+    second = compute_fn(_payload(_waveform(10)))
+
+    assert len(codec.calls) == 2
+    assert (
+        first.data["reference_codes_delayed"]
+        == second.data["reference_codes_delayed"]
+    )
+
+
+def test_higgs_audio_encoder_waveform_none_fast_path(monkeypatch) -> None:
+    compute_fn, codec = _audio_encoder_compute_fn(monkeypatch)
+    original = _payload(
+        None,
+        text="skip",
+        reference_codes_delayed=[[1, 2], [3, 4]],
+    )
+    original_data = dict(original.data)
+
+    result = compute_fn(original)
+
+    assert len(codec.calls) == 0
+    assert result.data == original_data
+
+
+def test_higgs_audio_encoder_lru_eviction(monkeypatch) -> None:
+    compute_fn, codec = _audio_encoder_compute_fn(
+        monkeypatch,
+        reference_audio_cache_size=2,
+    )
+    a = _waveform(1)
+    b = _waveform(10)
+    c = _waveform(20)
+
+    compute_fn(_payload(a))
+    compute_fn(_payload(b))
+    compute_fn(_payload(a))
+    compute_fn(_payload(c))
+    calls_after_c = len(codec.calls)
+    compute_fn(_payload(a))
+    compute_fn(_payload(c))
+    compute_fn(_payload(b))
+
+    assert calls_after_c == 3
+    assert len(codec.calls) == 4
+    assert [int(call.flatten()[0].item()) for call in codec.calls] == [
+        1,
+        10,
+        20,
+        10,
+    ]
+
+
+def test_higgs_audio_encoder_factory_args_preserve_cache_size() -> None:
+    config = HiggsTtsPipelineConfig(model_path="dummy-model")
+    audio_encoder = next(
+        stage for stage in config.stages if stage.name == "audio_encoder"
+    )
+    audio_encoder.factory_args["reference_audio_cache_size"] = 64
+
+    args = resolve_stage_factory_args(audio_encoder, config)
+
+    assert args["reference_audio_cache_size"] == 64
 
 
 def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:

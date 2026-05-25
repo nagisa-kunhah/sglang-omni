@@ -22,6 +22,7 @@ Pipeline shape::
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import Any
@@ -54,6 +55,7 @@ from sglang_omni.scheduling.sglang_backend import (
 )
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
+from sglang_omni.utils.lru_cache import LruCache
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,33 @@ logger = logging.getLogger(__name__)
 # Codec runs at 75 Hz; chunked prefill of the multi-codebook prompt is unsafe
 # (sampler state machine has no rollback) so reject inputs past chunked_prefill_size.
 _MAX_REF_AUDIO_SEC = 100
+
+
+def _reference_waveform_cache_key(
+    waveform: torch.Tensor,
+    *,
+    sample_rate: int = 24000,
+) -> bytes:
+    h = hashlib.blake2b(digest_size=32)
+    h.update(str(int(sample_rate)).encode("ascii"))
+    h.update(b"\0")
+    h.update(str(waveform.dtype).encode("ascii"))
+    h.update(b"\0")
+    h.update(",".join(str(dim) for dim in waveform.shape).encode("ascii"))
+    h.update(b"\0")
+
+    if waveform.device.type == "cpu":
+        cpu_waveform = waveform.detach().contiguous()
+    else:
+        # GPU tensors require a D2H sync to hash, but normal preprocessing
+        # hands this stage CPU tensors.
+        cpu_waveform = waveform.detach().cpu().contiguous()
+    h.update(memoryview(cpu_waveform.view(torch.uint8).numpy()).cast("B"))
+    return h.digest()
+
+
+def _copy_reference_codes_delayed(rows: list[list[int]]) -> list[list[int]]:
+    return [row.copy() for row in rows]
 
 
 def create_preprocessing_executor(
@@ -180,6 +209,7 @@ def create_audio_encoder_executor(
     num_codebooks: int = 8,
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
+    reference_audio_cache_size: int = 128,
 ):
     """GPU stage: codec-encode raw ref audio → delayed codes + prompt assembly.
 
@@ -193,6 +223,10 @@ def create_audio_encoder_executor(
     adapter = HiggsTokenizerAdapter(tokenizer)
 
     codec = get_or_load_codec(checkpoint_dir, device, dtype)
+    reference_audio_cache: LruCache[str, list[list[int]]] = LruCache(
+        reference_audio_cache_size,
+        copy_on_get=_copy_reference_codes_delayed,
+    )
 
     def _encode(payload: StagePayload) -> StagePayload:
         state = HiggsTtsState.from_dict(payload.data)
@@ -221,8 +255,35 @@ def create_audio_encoder_executor(
         payload.data = state.to_dict()
         return payload
 
+    def _cached_encode(payload: StagePayload) -> StagePayload:
+        state = HiggsTtsState.from_dict(payload.data)
+        waveform = state.reference_waveform
+        if waveform is None:
+            return _encode(payload)
+
+        cache_key = _reference_waveform_cache_key(waveform, sample_rate=24000).hex()
+        cached_delayed = reference_audio_cache.get(cache_key)
+        if cached_delayed is not None:
+            state.reference_codes_delayed = cached_delayed
+            state.prompt_token_ids = adapter.build_prompt(
+                state.target_text or "",
+                num_ref_tokens=len(cached_delayed),
+                reference_text=state.reference_text,
+            )
+            state.reference_waveform = None
+            state.target_text = None
+            state.reference_text = None
+            payload.data = state.to_dict()
+            return payload
+
+        result = _encode(payload)
+        encoded_state = HiggsTtsState.from_dict(result.data)
+        if encoded_state.reference_codes_delayed is not None:
+            reference_audio_cache.put(cache_key, encoded_state.reference_codes_delayed)
+        return result
+
     return SimpleScheduler(
-        _encode,
+        _cached_encode,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
     )
