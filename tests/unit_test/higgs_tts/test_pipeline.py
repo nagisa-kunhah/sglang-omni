@@ -115,8 +115,7 @@ def test_higgs_audio_encoder_caches_same_reference_audio(monkeypatch) -> None:
 
     assert len(codec.calls) == 1
     assert (
-        first.data["reference_codes_delayed"]
-        == second.data["reference_codes_delayed"]
+        first.data["reference_codes_delayed"] == second.data["reference_codes_delayed"]
     )
     assert first.data["prompt_token_ids"] != second.data["prompt_token_ids"]
     for data in (first.data, second.data):
@@ -133,8 +132,7 @@ def test_higgs_audio_encoder_cache_key_uses_waveform_content(monkeypatch) -> Non
 
     assert len(codec.calls) == 2
     assert (
-        first.data["reference_codes_delayed"]
-        != second.data["reference_codes_delayed"]
+        first.data["reference_codes_delayed"] != second.data["reference_codes_delayed"]
     )
 
 
@@ -149,8 +147,7 @@ def test_higgs_audio_encoder_cache_size_zero_disables_cache(monkeypatch) -> None
 
     assert len(codec.calls) == 2
     assert (
-        first.data["reference_codes_delayed"]
-        == second.data["reference_codes_delayed"]
+        first.data["reference_codes_delayed"] == second.data["reference_codes_delayed"]
     )
 
 
