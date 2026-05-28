@@ -241,6 +241,30 @@ def test_higgs_audio_encoder_waveform_none_fast_path(monkeypatch) -> None:
     assert result.data == original_data
 
 
+def test_higgs_audio_encoder_cache_miss_deserializes_once(monkeypatch) -> None:
+    compute_fn, codec = _audio_encoder_compute_fn(monkeypatch)
+    original_from_dict = stages.HiggsTtsState.from_dict
+    from_dict_calls = 0
+
+    def counting_from_dict(data):
+        nonlocal from_dict_calls
+        from_dict_calls += 1
+        return original_from_dict(data)
+
+    monkeypatch.setattr(
+        stages.HiggsTtsState, "from_dict", staticmethod(counting_from_dict)
+    )
+
+    result = compute_fn(_payload(_waveform(10), text="alpha"))
+
+    assert len(codec.calls) == 1
+    assert from_dict_calls == 1
+    assert result.data["reference_codes_delayed"] is not None
+    assert "reference_waveform" not in result.data
+    assert "target_text" not in result.data
+    assert "reference_text" not in result.data
+
+
 def test_higgs_audio_encoder_lru_eviction(monkeypatch) -> None:
     compute_fn, codec = _audio_encoder_compute_fn(
         monkeypatch,

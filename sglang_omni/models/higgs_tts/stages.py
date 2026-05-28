@@ -248,11 +248,15 @@ def create_audio_encoder_executor(
             size_of=lambda codes: codes.numel() * codes.element_size(),
         )
 
-    def _encode(payload: StagePayload) -> StagePayload:
-        state = HiggsTtsState.from_dict(payload.data)
+    def _encode_state(state: HiggsTtsState) -> bool:
+        """Encode raw reference audio and mutate ``state`` in place.
+
+        Fills delayed reference codes, rebuilds prompt tokens, and clears the
+        raw reference fields once encoding succeeds.
+        """
         waveform = state.reference_waveform
         if waveform is None:
-            return payload
+            return False
 
         ref_codes_TN = codec.encode_reference(waveform, sample_rate=24000).to(
             torch.long
@@ -272,6 +276,13 @@ def create_audio_encoder_executor(
         state.reference_waveform = None
         state.target_text = None
         state.reference_text = None
+        return True
+
+    def _encode(payload: StagePayload) -> StagePayload:
+        state = HiggsTtsState.from_dict(payload.data)
+        if not _encode_state(state):
+            return payload
+
         payload.data = state.to_dict()
         return payload
 
@@ -299,14 +310,16 @@ def create_audio_encoder_executor(
             payload.data = state.to_dict()
             return payload
 
-        result = _encode(payload)
-        encoded_state = HiggsTtsState.from_dict(result.data)
-        if encoded_state.reference_codes_delayed is not None:
+        if not _encode_state(state):
+            return payload
+
+        payload.data = state.to_dict()
+        if state.reference_codes_delayed is not None:
             reference_audio_cache.put(
                 cache_key,
-                _reference_codes_to_cache_tensor(encoded_state.reference_codes_delayed),
+                _reference_codes_to_cache_tensor(state.reference_codes_delayed),
             )
-        return result
+        return payload
 
     return SimpleScheduler(
         _cached_encode if cache_enabled else _encode,
