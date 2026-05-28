@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang_omni.config import resolve_stage_factory_args
@@ -68,7 +69,7 @@ def _audio_encoder_compute_fn(
     monkeypatch,
     *,
     codec: _FakeCodec | None = None,
-    reference_audio_cache_size: int = 128,
+    reference_audio_cache_size: int | None = 128,
 ):
     codec = codec or _FakeCodec()
     _install_audio_encoder_fakes(monkeypatch, codec)
@@ -136,10 +137,26 @@ def test_higgs_audio_encoder_cache_key_uses_waveform_content(monkeypatch) -> Non
     )
 
 
-def test_higgs_audio_encoder_cache_size_zero_disables_cache(monkeypatch) -> None:
+@pytest.mark.parametrize("reference_audio_cache_size", [0, -1, None])
+def test_higgs_audio_encoder_disabled_cache_skips_cache_setup_and_key_hash(
+    monkeypatch,
+    reference_audio_cache_size: int | None,
+) -> None:
+    class FailingLruCache:
+        def __init__(self, *_args, **_kwargs) -> None:
+            raise AssertionError(
+                "LruCache should not be constructed when cache is disabled"
+            )
+
+    def fail_cache_key(*_args, **_kwargs):
+        raise AssertionError("_reference_waveform_cache_key should not be called")
+
+    monkeypatch.setattr(stages, "LruCache", FailingLruCache)
+    monkeypatch.setattr(stages, "_reference_waveform_cache_key", fail_cache_key)
+
     compute_fn, codec = _audio_encoder_compute_fn(
         monkeypatch,
-        reference_audio_cache_size=0,
+        reference_audio_cache_size=reference_audio_cache_size,
     )
 
     first = compute_fn(_payload(_waveform(10)))

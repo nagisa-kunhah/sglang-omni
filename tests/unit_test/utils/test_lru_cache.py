@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from sglang_omni.utils.lru_cache import LruCache
+from sglang_omni.utils.lru_cache import LruCache, normalize_lru_max_size
+
+
+def test_normalize_lru_max_size() -> None:
+    assert normalize_lru_max_size(2) == 2
+    assert normalize_lru_max_size(0) == 0
+    assert normalize_lru_max_size(-1) == 0
+    assert normalize_lru_max_size(None) == 0
 
 
 def test_lru_cache_eviction_uses_lru_order() -> None:
@@ -33,6 +40,14 @@ def test_lru_cache_copy_on_get_protects_cached_value() -> None:
 
 def test_lru_cache_max_size_zero_disables_cache() -> None:
     cache: LruCache[str, int] = LruCache(max_size=0)
+
+    cache.put("a", 1)
+
+    assert cache.get("a") is None
+
+
+def test_lru_cache_max_size_none_disables_cache() -> None:
+    cache: LruCache[str, int] = LruCache(max_size=None)
 
     cache.put("a", 1)
 

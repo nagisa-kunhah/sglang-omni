@@ -55,7 +55,7 @@ from sglang_omni.scheduling.sglang_backend import (
 )
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
-from sglang_omni.utils.lru_cache import LruCache
+from sglang_omni.utils.lru_cache import LruCache, normalize_lru_max_size
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +209,7 @@ def create_audio_encoder_executor(
     num_codebooks: int = 8,
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
-    reference_audio_cache_size: int = 128,
+    reference_audio_cache_size: int | None = 128,
 ):
     """GPU stage: codec-encode raw ref audio → delayed codes + prompt assembly.
 
@@ -223,10 +223,16 @@ def create_audio_encoder_executor(
     adapter = HiggsTokenizerAdapter(tokenizer)
 
     codec = get_or_load_codec(checkpoint_dir, device, dtype)
-    reference_audio_cache: LruCache[str, list[list[int]]] = LruCache(
-        reference_audio_cache_size,
-        copy_on_get=_copy_reference_codes_delayed,
+    normalized_reference_audio_cache_size = normalize_lru_max_size(
+        reference_audio_cache_size
     )
+    cache_enabled = normalized_reference_audio_cache_size != 0
+    reference_audio_cache: LruCache[str, list[list[int]]] | None = None
+    if cache_enabled:
+        reference_audio_cache = LruCache(
+            normalized_reference_audio_cache_size,
+            copy_on_get=_copy_reference_codes_delayed,
+        )
 
     def _encode(payload: StagePayload) -> StagePayload:
         state = HiggsTtsState.from_dict(payload.data)
@@ -256,6 +262,9 @@ def create_audio_encoder_executor(
         return payload
 
     def _cached_encode(payload: StagePayload) -> StagePayload:
+        if reference_audio_cache is None:
+            return _encode(payload)
+
         state = HiggsTtsState.from_dict(payload.data)
         waveform = state.reference_waveform
         if waveform is None:
@@ -283,7 +292,7 @@ def create_audio_encoder_executor(
         return result
 
     return SimpleScheduler(
-        _cached_encode,
+        _cached_encode if cache_enabled else _encode,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
     )

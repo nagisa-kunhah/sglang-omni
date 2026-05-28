@@ -9,6 +9,10 @@ K = TypeVar("K", bound=Hashable)
 V = TypeVar("V")
 
 
+def normalize_lru_max_size(max_size: int | None) -> int:
+    return max(int(max_size), 0) if max_size is not None else 0
+
+
 class LruCache(Generic[K, V]):
     """Small in-memory LRU cache for process-local reusable values."""
 
@@ -18,7 +22,7 @@ class LruCache(Generic[K, V]):
         *,
         copy_on_get: Callable[[V], V] | None = None,
     ) -> None:
-        self.max_size = max(int(max_size), 0) if max_size is not None else None
+        self.max_size = normalize_lru_max_size(max_size)
         self.copy_on_get = copy_on_get
         self._entries: OrderedDict[K, V] = OrderedDict()
 
@@ -45,8 +49,8 @@ class LruCache(Generic[K, V]):
         self._entries.clear()
 
     def _evict_over_budget(self) -> None:
-        while self.max_size is not None and len(self._entries) > self.max_size:
+        while len(self._entries) > self.max_size:
             self._entries.popitem(last=False)
 
 
-__all__ = ["LruCache"]
+__all__ = ["LruCache", "normalize_lru_max_size"]
