@@ -11,6 +11,8 @@ stages:
     factory: sglang_omni.models.higgs_tts.stages.create_audio_encoder_executor
     factory_args:
       device: cuda
+      reference_audio_cache_size: 128
+      reference_audio_cache_max_bytes: 268435456
     gpu: 0
     next: tts_engine
   - name: tts_engine

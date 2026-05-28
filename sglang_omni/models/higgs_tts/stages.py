@@ -55,7 +55,10 @@ from sglang_omni.scheduling.sglang_backend import (
 )
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
-from sglang_omni.utils.lru_cache import LruCache, normalize_lru_max_size
+from sglang_omni.utils.lru_cache import (
+    LruCache,
+    normalize_lru_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,7 @@ logger = logging.getLogger(__name__)
 # Codec runs at 75 Hz; chunked prefill of the multi-codebook prompt is unsafe
 # (sampler state machine has no rollback) so reject inputs past chunked_prefill_size.
 _MAX_REF_AUDIO_SEC = 100
+_DEFAULT_REFERENCE_AUDIO_CACHE_MAX_BYTES = 256 * 1024 * 1024
 
 
 def _reference_waveform_cache_key(
@@ -88,8 +92,8 @@ def _reference_waveform_cache_key(
     return h.digest()
 
 
-def _copy_reference_codes_delayed(rows: list[list[int]]) -> list[list[int]]:
-    return [row.copy() for row in rows]
+def _reference_codes_to_cache_tensor(rows: list[list[int]]) -> torch.Tensor:
+    return torch.as_tensor(rows, dtype=torch.int16, device="cpu").contiguous()
 
 
 def create_preprocessing_executor(
@@ -210,6 +214,9 @@ def create_audio_encoder_executor(
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
     reference_audio_cache_size: int | None = 128,
+    reference_audio_cache_max_bytes: int | None = (
+        _DEFAULT_REFERENCE_AUDIO_CACHE_MAX_BYTES
+    ),
 ):
     """GPU stage: codec-encode raw ref audio → delayed codes + prompt assembly.
 
@@ -223,15 +230,22 @@ def create_audio_encoder_executor(
     adapter = HiggsTokenizerAdapter(tokenizer)
 
     codec = get_or_load_codec(checkpoint_dir, device, dtype)
-    normalized_reference_audio_cache_size = normalize_lru_max_size(
+    normalized_reference_audio_cache_size = normalize_lru_limit(
         reference_audio_cache_size
     )
-    cache_enabled = normalized_reference_audio_cache_size != 0
-    reference_audio_cache: LruCache[str, list[list[int]]] | None = None
+    normalized_reference_audio_cache_max_bytes = normalize_lru_limit(
+        reference_audio_cache_max_bytes
+    )
+    cache_enabled = (
+        normalized_reference_audio_cache_size != 0
+        and normalized_reference_audio_cache_max_bytes != 0
+    )
+    reference_audio_cache: LruCache[str, torch.Tensor] | None = None
     if cache_enabled:
         reference_audio_cache = LruCache(
-            normalized_reference_audio_cache_size,
-            copy_on_get=_copy_reference_codes_delayed,
+            max_size=normalized_reference_audio_cache_size,
+            max_bytes=normalized_reference_audio_cache_max_bytes,
+            size_of=lambda codes: codes.numel() * codes.element_size(),
         )
 
     def _encode(payload: StagePayload) -> StagePayload:
@@ -268,15 +282,15 @@ def create_audio_encoder_executor(
         state = HiggsTtsState.from_dict(payload.data)
         waveform = state.reference_waveform
         if waveform is None:
-            return _encode(payload)
+            return payload
 
         cache_key = _reference_waveform_cache_key(waveform, sample_rate=24000).hex()
-        cached_delayed = reference_audio_cache.get(cache_key)
-        if cached_delayed is not None:
-            state.reference_codes_delayed = cached_delayed
+        cached_codes = reference_audio_cache.get(cache_key)
+        if cached_codes is not None:
+            state.reference_codes_delayed = cached_codes.tolist()
             state.prompt_token_ids = adapter.build_prompt(
                 state.target_text or "",
-                num_ref_tokens=len(cached_delayed),
+                num_ref_tokens=cached_codes.shape[0],
                 reference_text=state.reference_text,
             )
             state.reference_waveform = None
@@ -288,7 +302,10 @@ def create_audio_encoder_executor(
         result = _encode(payload)
         encoded_state = HiggsTtsState.from_dict(result.data)
         if encoded_state.reference_codes_delayed is not None:
-            reference_audio_cache.put(cache_key, encoded_state.reference_codes_delayed)
+            reference_audio_cache.put(
+                cache_key,
+                _reference_codes_to_cache_tensor(encoded_state.reference_codes_delayed),
+            )
         return result
 
     return SimpleScheduler(

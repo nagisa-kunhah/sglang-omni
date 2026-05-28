@@ -54,6 +54,32 @@ class _FakeCodec:
         )
 
 
+class _VariableLengthCodec:
+    def __init__(self) -> None:
+        self.calls: list[torch.Tensor] = []
+
+    def encode_reference(self, waveform: torch.Tensor, *, sample_rate: int):
+        self.calls.append(waveform.clone())
+        rows = int(waveform.flatten()[0].item())
+        return torch.tensor(
+            [[rows + idx, rows + idx + 100] for idx in range(rows)],
+            dtype=torch.long,
+        )
+
+
+def _capture_lru_cache(monkeypatch):
+    captured = {}
+    original_lru_cache = stages.LruCache
+
+    class CapturingLruCache(original_lru_cache):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            captured["cache"] = self
+
+    monkeypatch.setattr(stages, "LruCache", CapturingLruCache)
+    return captured
+
+
 def _install_audio_encoder_fakes(monkeypatch, codec: _FakeCodec) -> None:
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
     monkeypatch.setattr(stages, "Tokenizer", _FakeTokenizer)
@@ -68,8 +94,9 @@ def _install_audio_encoder_fakes(monkeypatch, codec: _FakeCodec) -> None:
 def _audio_encoder_compute_fn(
     monkeypatch,
     *,
-    codec: _FakeCodec | None = None,
+    codec: _FakeCodec | _VariableLengthCodec | None = None,
     reference_audio_cache_size: int | None = 128,
+    reference_audio_cache_max_bytes: int | None = 256 * 1024 * 1024,
 ):
     codec = codec or _FakeCodec()
     _install_audio_encoder_fakes(monkeypatch, codec)
@@ -78,6 +105,7 @@ def _audio_encoder_compute_fn(
         device="cpu",
         num_codebooks=2,
         reference_audio_cache_size=reference_audio_cache_size,
+        reference_audio_cache_max_bytes=reference_audio_cache_max_bytes,
     )
     return scheduler.compute_fn, codec
 
@@ -137,26 +165,42 @@ def test_higgs_audio_encoder_cache_key_uses_waveform_content(monkeypatch) -> Non
     )
 
 
-@pytest.mark.parametrize("reference_audio_cache_size", [0, -1, None])
+@pytest.mark.parametrize(
+    ("reference_audio_cache_size", "reference_audio_cache_max_bytes"),
+    [
+        (0, 256 * 1024 * 1024),
+        (-1, 256 * 1024 * 1024),
+        (None, 256 * 1024 * 1024),
+        (128, 0),
+        (128, -1),
+        (128, None),
+    ],
+)
 def test_higgs_audio_encoder_disabled_cache_skips_cache_setup_and_key_hash(
     monkeypatch,
     reference_audio_cache_size: int | None,
+    reference_audio_cache_max_bytes: int | None,
 ) -> None:
     class FailingLruCache:
         def __init__(self, *_args, **_kwargs) -> None:
             raise AssertionError(
-                "LruCache should not be constructed when cache is disabled"
+                "reference audio cache should not be constructed when disabled"
             )
 
     def fail_cache_key(*_args, **_kwargs):
         raise AssertionError("_reference_waveform_cache_key should not be called")
 
-    monkeypatch.setattr(stages, "LruCache", FailingLruCache)
+    monkeypatch.setattr(
+        stages,
+        "LruCache",
+        FailingLruCache,
+    )
     monkeypatch.setattr(stages, "_reference_waveform_cache_key", fail_cache_key)
 
     compute_fn, codec = _audio_encoder_compute_fn(
         monkeypatch,
         reference_audio_cache_size=reference_audio_cache_size,
+        reference_audio_cache_max_bytes=reference_audio_cache_max_bytes,
     )
 
     first = compute_fn(_payload(_waveform(10)))
@@ -170,6 +214,18 @@ def test_higgs_audio_encoder_disabled_cache_skips_cache_setup_and_key_hash(
 
 def test_higgs_audio_encoder_waveform_none_fast_path(monkeypatch) -> None:
     compute_fn, codec = _audio_encoder_compute_fn(monkeypatch)
+    original_from_dict = stages.HiggsTtsState.from_dict
+    from_dict_calls = 0
+
+    def counting_from_dict(data):
+        nonlocal from_dict_calls
+        from_dict_calls += 1
+        return original_from_dict(data)
+
+    monkeypatch.setattr(
+        stages.HiggsTtsState, "from_dict", staticmethod(counting_from_dict)
+    )
+
     original = _payload(
         None,
         text="skip",
@@ -180,6 +236,8 @@ def test_higgs_audio_encoder_waveform_none_fast_path(monkeypatch) -> None:
     result = compute_fn(original)
 
     assert len(codec.calls) == 0
+    assert from_dict_calls == 1
+    assert result is original
     assert result.data == original_data
 
 
@@ -211,16 +269,135 @@ def test_higgs_audio_encoder_lru_eviction(monkeypatch) -> None:
     ]
 
 
+def test_higgs_audio_encoder_cache_stores_cpu_int16_tensor_and_hits_as_lists(
+    monkeypatch,
+) -> None:
+    captured = _capture_lru_cache(monkeypatch)
+    compute_fn, codec = _audio_encoder_compute_fn(monkeypatch)
+
+    first = compute_fn(_payload(_waveform(10), text="alpha"))
+    second = compute_fn(_payload(_waveform(10), text="bravo"))
+
+    assert len(codec.calls) == 1
+    assert (
+        first.data["reference_codes_delayed"] == second.data["reference_codes_delayed"]
+    )
+    cached_codes = next(iter(captured["cache"]._entries.values())).value
+    assert cached_codes.dtype == torch.int16
+    assert cached_codes.device.type == "cpu"
+    assert cached_codes.is_contiguous()
+    assert cached_codes.tolist() == first.data["reference_codes_delayed"]
+    assert isinstance(second.data["reference_codes_delayed"], list)
+    assert all(isinstance(row, list) for row in second.data["reference_codes_delayed"])
+
+
+def test_higgs_audio_encoder_cache_put_isolated_from_returned_payload_mutation(
+    monkeypatch,
+) -> None:
+    compute_fn, codec = _audio_encoder_compute_fn(monkeypatch)
+
+    first = compute_fn(_payload(_waveform(10), text="alpha"))
+    original_codes = [row.copy() for row in first.data["reference_codes_delayed"]]
+    first.data["reference_codes_delayed"][0][0] = -999
+
+    second = compute_fn(_payload(_waveform(10), text="bravo"))
+
+    assert len(codec.calls) == 1
+    assert second.data["reference_codes_delayed"] == original_codes
+
+
+def test_higgs_audio_encoder_byte_budget_evicts_long_reference_codes(
+    monkeypatch,
+) -> None:
+    captured = _capture_lru_cache(monkeypatch)
+    codec = _VariableLengthCodec()
+    compute_fn, codec = _audio_encoder_compute_fn(
+        monkeypatch,
+        codec=codec,
+        reference_audio_cache_size=3,
+        reference_audio_cache_max_bytes=28,
+    )
+    a = _waveform(2)
+    b = _waveform(3)
+    c = _waveform(6)
+
+    compute_fn(_payload(a))
+    compute_fn(_payload(b))
+    compute_fn(_payload(a))
+    compute_fn(_payload(c))
+
+    cache = captured["cache"]
+    assert cache.total_bytes == 28
+    assert len(cache._entries) == 1
+    assert (
+        cache.get(stages._reference_waveform_cache_key(a, sample_rate=24000).hex())
+        is None
+    )
+    assert (
+        cache.get(stages._reference_waveform_cache_key(b, sample_rate=24000).hex())
+        is None
+    )
+    assert (
+        cache.get(stages._reference_waveform_cache_key(c, sample_rate=24000).hex())
+        is not None
+    )
+
+    compute_fn(_payload(b))
+    assert [int(call.flatten()[0].item()) for call in codec.calls] == [2, 3, 6, 3]
+
+
+def test_higgs_audio_encoder_skips_oversized_reference_codes_without_clearing_cache(
+    monkeypatch,
+) -> None:
+    captured = _capture_lru_cache(monkeypatch)
+    codec = _VariableLengthCodec()
+    compute_fn, codec = _audio_encoder_compute_fn(
+        monkeypatch,
+        codec=codec,
+        reference_audio_cache_size=3,
+        reference_audio_cache_max_bytes=16,
+    )
+    small = _waveform(2)
+    oversized = _waveform(9)
+
+    compute_fn(_payload(small))
+    compute_fn(_payload(oversized))
+    compute_fn(_payload(small))
+
+    cache = captured["cache"]
+    assert cache.total_bytes == 12
+    assert len(cache._entries) == 1
+    assert (
+        cache.get(stages._reference_waveform_cache_key(small, sample_rate=24000).hex())
+        is not None
+    )
+    assert (
+        cache.get(
+            stages._reference_waveform_cache_key(oversized, sample_rate=24000).hex()
+        )
+        is None
+    )
+    assert [int(call.flatten()[0].item()) for call in codec.calls] == [2, 9]
+
+
 def test_higgs_audio_encoder_factory_args_preserve_cache_size() -> None:
     config = HiggsTtsPipelineConfig(model_path="dummy-model")
     audio_encoder = next(
         stage for stage in config.stages if stage.name == "audio_encoder"
     )
+
+    assert audio_encoder.factory_args["reference_audio_cache_size"] == 128
+    assert audio_encoder.factory_args["reference_audio_cache_max_bytes"] == (
+        256 * 1024 * 1024
+    )
+
     audio_encoder.factory_args["reference_audio_cache_size"] = 64
+    audio_encoder.factory_args["reference_audio_cache_max_bytes"] = 1024
 
     args = resolve_stage_factory_args(audio_encoder, config)
 
     assert args["reference_audio_cache_size"] == 64
+    assert args["reference_audio_cache_max_bytes"] == 1024
 
 
 def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:

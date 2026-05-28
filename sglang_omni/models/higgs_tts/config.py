@@ -35,7 +35,11 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             name="audio_encoder",
             process="pipeline",
             factory=f"{_PKG}.stages.create_audio_encoder_executor",
-            factory_args={"device": "cuda"},
+            factory_args={
+                "device": "cuda",
+                "reference_audio_cache_size": 128,
+                "reference_audio_cache_max_bytes": 256 * 1024 * 1024,
+            },
             gpu=0,
             next="tts_engine",
         ),
