@@ -55,10 +55,7 @@ from sglang_omni.scheduling.sglang_backend import (
 )
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
-from sglang_omni.utils.lru_cache import (
-    LruCache,
-    normalize_lru_limit,
-)
+from sglang_omni.utils.lru_cache import LruCache, normalize_lru_limit
 
 logger = logging.getLogger(__name__)
 

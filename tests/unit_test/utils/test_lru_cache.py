@@ -2,10 +2,7 @@
 
 import pytest
 
-from sglang_omni.utils.lru_cache import (
-    LruCache,
-    normalize_lru_limit,
-)
+from sglang_omni.utils.lru_cache import LruCache, normalize_lru_limit
 
 
 def test_normalize_lru_limit() -> None:
