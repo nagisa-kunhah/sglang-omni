@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -39,6 +40,113 @@ def fast_sampling_params(monkeypatch: pytest.MonkeyPatch) -> None:
         "sglang.srt.sampling.sampling_params.SamplingParams.verify",
         lambda self, vocab_size: None,
     )
+
+
+def _install_s2pro_tts_factory_fakes(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    from sglang_omni.engines.omni import compile as compile_mod
+    from sglang_omni.models.fishaudio_s2_pro import bootstrap, model_runner, stages
+    from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
+    from sglang_omni.scheduling import sglang_backend
+
+    calls = SimpleNamespace(
+        build_kwargs={},
+        infrastructure_disable_cuda_graph=None,
+        init_device_graphs=[],
+        compile_count=0,
+        events=[],
+    )
+
+    class FakeSGLangRunner:
+        def __init__(self, server_args) -> None:
+            self.server_args = server_args
+            self.model = object()
+
+        def init_device_graphs(self) -> None:
+            calls.events.append("init_device_graphs")
+            calls.init_device_graphs.append(
+                {
+                    "disable_cuda_graph": self.server_args.disable_cuda_graph,
+                    "enable_torch_compile": self.server_args.enable_torch_compile,
+                    "torch_compile_max_bs": self.server_args.torch_compile_max_bs,
+                }
+            )
+
+    monkeypatch.setattr(stages, "_resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(bootstrap, "patch_fish_config_for_sglang", lambda: None)
+    monkeypatch.setattr(bootstrap, "truncate_rope_to_bf16", lambda model: None)
+    monkeypatch.setattr(
+        bootstrap, "bootstrap_text_model_for_decode", lambda **kwargs: None
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "load_audio_decoder",
+        lambda checkpoint_dir, device: (
+            SimpleNamespace(),
+            2,
+            4096,
+            FakeFishTokenizer(),
+        ),
+    )
+    monkeypatch.setattr(
+        stages,
+        "make_tts_scheduler_adapters",
+        lambda **kwargs: (lambda payload: payload, lambda data: data),
+    )
+    monkeypatch.setattr(
+        sglang_backend,
+        "SGLangOutputProcessor",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(
+        model_runner,
+        "FishS2ProModelRunner",
+        lambda *args, **kwargs: SimpleNamespace(args=args, kwargs=kwargs),
+    )
+
+    def fake_build_sglang_server_args(model_path, context_length, **kwargs):
+        del model_path, context_length
+        calls.build_kwargs = kwargs
+        return SimpleNamespace(
+            disable_cuda_graph=kwargs["disable_cuda_graph"],
+            enable_torch_compile=kwargs.get("enable_torch_compile", False),
+            torch_compile_max_bs=kwargs.get("torch_compile_max_bs", 16),
+            max_running_requests=kwargs["max_running_requests"],
+            chunked_prefill_size=kwargs["chunked_prefill_size"],
+            max_prefill_tokens=kwargs.get("max_prefill_tokens", 8192),
+            page_size=1,
+            attention_backend=kwargs.get("attention_backend"),
+        )
+
+    def fake_create_sglang_infrastructure(server_args, gpu_id):
+        del gpu_id
+        calls.infrastructure_disable_cuda_graph = server_args.disable_cuda_graph
+        return (
+            SimpleNamespace(model_runner=FakeSGLangRunner(server_args)),
+            object(),
+            object(),
+            object(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+        )
+
+    def fake_apply_compile_targets(model):
+        del model
+        calls.events.append("apply_compile_targets")
+        calls.compile_count += 1
+        return ["fake-target"]
+
+    monkeypatch.setattr(
+        sglang_backend, "build_sglang_server_args", fake_build_sglang_server_args
+    )
+    monkeypatch.setattr(
+        scheduling_bootstrap,
+        "create_sglang_infrastructure",
+        fake_create_sglang_infrastructure,
+    )
+    monkeypatch.setattr(compile_mod, "apply_compile_targets", fake_apply_compile_targets)
+
+    return calls
 
 
 def test_fish_config_state_and_tokenizer_prompt_contracts() -> None:
@@ -98,6 +206,96 @@ def test_fish_compile_example_config_targets_current_stage_factory() -> None:
         "sglang_omni.models.fishaudio_s2_pro.stages."
         "create_sglang_tts_engine_executor"
     )
+
+
+def test_fish_full_compile_example_config_uses_server_args_overrides() -> None:
+    manager = ConfigManager.from_file(
+        str(_REPO_ROOT / "examples" / "configs" / "s2pro_tts_full_compile.yaml")
+    )
+    config = manager.config
+
+    overrides = config.runtime_overrides["tts_engine"]["server_args_overrides"]
+    assert overrides == {
+        "enable_torch_compile": True,
+        "torch_compile_max_bs": 32,
+    }
+
+
+def test_fish_tts_full_compile_survives_deferred_cuda_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _install_s2pro_tts_factory_fakes(monkeypatch)
+    from sglang_omni.models.fishaudio_s2_pro import stages
+
+    scheduler = stages.create_sglang_tts_engine_executor(
+        "model",
+        device="cuda:0",
+        server_args_overrides={
+            "enable_torch_compile": True,
+            "torch_compile_max_bs": 32,
+        },
+    )
+
+    assert calls.build_kwargs["enable_torch_compile"] is True
+    assert calls.build_kwargs["torch_compile_max_bs"] == 32
+    assert calls.infrastructure_disable_cuda_graph is True
+    assert calls.init_device_graphs == [
+        {
+            "disable_cuda_graph": False,
+            "enable_torch_compile": True,
+            "torch_compile_max_bs": 32,
+        }
+    ]
+    assert calls.compile_count == 0
+    assert scheduler.batch_planner.server_args.enable_torch_compile is True
+
+
+def test_fish_tts_partial_compile_runs_before_cuda_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _install_s2pro_tts_factory_fakes(monkeypatch)
+    from sglang_omni.models.fishaudio_s2_pro import stages
+
+    stages.create_sglang_tts_engine_executor(
+        "model",
+        device="cuda:0",
+        compile_level="partial",
+    )
+
+    assert calls.compile_count == 1
+    assert calls.events == ["apply_compile_targets", "init_device_graphs"]
+    assert calls.init_device_graphs == [
+        {
+            "disable_cuda_graph": False,
+            "enable_torch_compile": False,
+            "torch_compile_max_bs": 16,
+        }
+    ]
+
+
+def test_fish_tts_rejects_partial_and_sglang_full_compile_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _install_s2pro_tts_factory_fakes(monkeypatch)
+    from sglang_omni.models.fishaudio_s2_pro import stages
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "compile_level='partial' cannot be combined with "
+            "server_args_overrides.enable_torch_compile=True"
+        ),
+    ):
+        stages.create_sglang_tts_engine_executor(
+            "model",
+            compile_level="partial",
+            server_args_overrides={"enable_torch_compile": True},
+        )
+
+    assert calls.build_kwargs == {}
+    assert calls.infrastructure_disable_cuda_graph is None
+    assert calls.compile_count == 0
+    assert calls.init_device_graphs == []
 
 
 def test_fish_tts_request_and_result_adapters_preserve_tensor_contracts() -> None:

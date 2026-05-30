@@ -1,0 +1,8 @@
+config_cls: S2ProPipelineConfig
+model_path: fishaudio/s2-pro
+relay_backend: shm
+runtime_overrides:
+  tts_engine:
+    server_args_overrides:
+      enable_torch_compile: true
+      torch_compile_max_bs: 32

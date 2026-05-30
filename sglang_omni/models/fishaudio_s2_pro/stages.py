@@ -198,6 +198,11 @@ def create_sglang_tts_engine_executor(
     }
     if server_args_overrides:
         overrides.update(server_args_overrides)
+    if compile_level == "partial" and overrides.get("enable_torch_compile") is True:
+        raise ValueError(
+            "compile_level='partial' cannot be combined with "
+            "server_args_overrides.enable_torch_compile=True"
+        )
 
     server_args = build_sglang_server_args(
         checkpoint_dir,
@@ -244,9 +249,7 @@ def create_sglang_tts_engine_executor(
         ras_window=ras_window,
     )
 
-    if compile_level == "partial" or bool(
-        getattr(server_args, "enable_torch_compile", False)
-    ):
+    if compile_level == "partial":
         from sglang_omni.engines.omni.compile import apply_compile_targets
 
         compiled = apply_compile_targets(model_worker.model_runner.model)
