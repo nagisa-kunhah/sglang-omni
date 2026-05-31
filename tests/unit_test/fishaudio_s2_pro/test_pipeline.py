@@ -42,7 +42,9 @@ def fast_sampling_params(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def _install_s2pro_tts_factory_fakes(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+def _install_s2pro_tts_factory_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> SimpleNamespace:
     from sglang_omni.engines.omni import compile as compile_mod
     from sglang_omni.models.fishaudio_s2_pro import bootstrap, model_runner, stages
     from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
@@ -144,7 +146,9 @@ def _install_s2pro_tts_factory_fakes(monkeypatch: pytest.MonkeyPatch) -> SimpleN
         "create_sglang_infrastructure",
         fake_create_sglang_infrastructure,
     )
-    monkeypatch.setattr(compile_mod, "apply_compile_targets", fake_apply_compile_targets)
+    monkeypatch.setattr(
+        compile_mod, "apply_compile_targets", fake_apply_compile_targets
+    )
 
     return calls
 
