@@ -56,6 +56,65 @@ def _torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
     return getattr(torch, dtype) if isinstance(dtype, str) else dtype
 
 
+def _warmup_moss_audio_encoder(processor: Any) -> None:
+    encode_audios = getattr(processor, "encode_audios_from_wav", None)
+    if not callable(encode_audios):
+        logger.warning(
+            "Skipping MOSS audio encoder torch.compile warmup: "
+            "processor.encode_audios_from_wav is unavailable"
+        )
+        return
+    model_config = getattr(processor, "model_config", None)
+    sample_rate = int(getattr(model_config, "sampling_rate", 24000) or 24000)
+    encode_audios([torch.zeros((1, sample_rate), dtype=torch.float32)], sample_rate)
+
+
+def _compile_moss_audio_encoder(
+    processor: Any,
+    *,
+    mode: str | None,
+) -> None:
+    """Compile the narrowest visible MOSS reference-audio encoder entrypoint."""
+
+    audio_tokenizer = getattr(processor, "audio_tokenizer", None)
+    if audio_tokenizer is None:
+        raise RuntimeError("MOSS processor has no audio_tokenizer to torch.compile")
+
+    compile_kwargs = {"mode": mode} if mode else {}
+    encode = getattr(audio_tokenizer, "encode", None)
+    original_encode = encode if callable(encode) else None
+    original_audio_tokenizer = audio_tokenizer
+    target_desc = "audio_tokenizer.encode" if original_encode else "audio_tokenizer"
+
+    try:
+        if original_encode is not None:
+            audio_tokenizer.encode = torch.compile(original_encode, **compile_kwargs)
+        elif callable(audio_tokenizer):
+            processor.audio_tokenizer = torch.compile(
+                audio_tokenizer, **compile_kwargs
+            )
+        else:
+            raise RuntimeError(
+                "MOSS audio_tokenizer exposes neither a callable encode method "
+                "nor a callable module interface"
+            )
+        _warmup_moss_audio_encoder(processor)
+    except Exception as exc:
+        if original_encode is not None:
+            audio_tokenizer.encode = original_encode
+        processor.audio_tokenizer = original_audio_tokenizer
+        logger.exception("MOSS audio encoder torch.compile failed for %s", target_desc)
+        raise RuntimeError(
+            f"MOSS audio encoder torch.compile failed for {target_desc}"
+        ) from exc
+
+    logger.info(
+        "Enabled MOSS audio encoder torch.compile for %s (mode=%s)",
+        target_desc,
+        mode,
+    )
+
+
 @contextmanager
 def _moss_transformers_processor_compat():
     """Scope load-time Transformers API-drift patches to the MOSS processor load
@@ -145,6 +204,8 @@ def _load_moss_processor(
     *,
     device: str = "cpu",
     dtype: str | torch.dtype = "float32",
+    enable_encoder_torch_compile: bool = False,
+    encoder_torch_compile_mode: str | None = "default",
 ) -> Any:
     checkpoint_dir = _resolve_checkpoint(model_path)
     logger.info("Loading MOSS-TTS processor from %s on %s", checkpoint_dir, device)
@@ -168,6 +229,11 @@ def _load_moss_processor(
             if device != "cpu":
                 kwargs["dtype"] = _torch_dtype(dtype)
             audio_tokenizer.to(**kwargs)
+    if enable_encoder_torch_compile:
+        _compile_moss_audio_encoder(
+            processor,
+            mode=encoder_torch_compile_mode,
+        )
     return processor
 
 
@@ -185,9 +251,21 @@ def _build_usage(state: MossTTSState) -> dict[str, Any] | None:
 
 
 def create_preprocessing_executor(
-    model_path: str, *, max_concurrency: int = 8
+    model_path: str,
+    *,
+    max_concurrency: int = 8,
+    encoder_device: str = "cpu",
+    encoder_dtype: str = "float32",
+    enable_encoder_torch_compile: bool = False,
+    encoder_torch_compile_mode: str | None = "default",
 ) -> SimpleScheduler:
-    processor = _load_moss_processor(model_path, device="cpu", dtype="float32")
+    processor = _load_moss_processor(
+        model_path,
+        device=encoder_device,
+        dtype=encoder_dtype,
+        enable_encoder_torch_compile=enable_encoder_torch_compile,
+        encoder_torch_compile_mode=encoder_torch_compile_mode,
+    )
     set_moss_tts_preprocessing_context(processor=processor)
     # Preprocessing is CPU-heavy: every request tokenizes text and encodes the
     # reference audio through the MOSS audio tokenizer. Serial execution
