@@ -1,0 +1,107 @@
+config_cls: MossTTSPipelineConfig
+endpoints:
+  base_path: /tmp/sglang_omni
+entry_stage: null
+env_defaults: {}
+fused_stages: []
+model_path: /tmp/moss-tts-v15
+name: /tmp/moss-tts-v15
+placement:
+  max_total_gpu_memory_fraction_per_gpu: 1.0
+  require_memory_fraction_for_colocation: true
+placement_policy: null
+relay_backend: shm
+runtime_overrides: {}
+stages:
+- can_accept_stream_before_payload: false
+  factory: sglang_omni.models.moss_tts.stages.create_preprocessing_executor
+  factory_args:
+    enable_encoder_torch_compile: true
+    encoder_dtype: float32
+    encoder_torch_compile_fullgraph: true
+    encoder_torch_compile_mode: default
+    encoder_torch_compile_target: batch_encode
+  gpu: null
+  merge_fn: null
+  name: preprocessing
+  next: tts_engine
+  parallelism:
+    tp: 1
+  process: pipeline
+  project_payload: {}
+  relay: null
+  route_fn: null
+  runtime:
+    max_seq_len: null
+    resources:
+      total_gpu_memory_fraction: null
+    sglang_server_args:
+      mem_fraction_static: null
+    video_fps: null
+  runtime_arg_map: {}
+  stream_done_to_fn: null
+  stream_to: []
+  terminal: false
+  tp_size: 1
+  wait_for: null
+  wait_for_fn: null
+- can_accept_stream_before_payload: false
+  factory: sglang_omni.models.moss_tts.stages.create_sglang_tts_engine_executor
+  factory_args:
+    dtype: bfloat16
+    gpu_id: 0
+  gpu: 0
+  merge_fn: null
+  name: tts_engine
+  next: vocoder
+  parallelism:
+    tp: 1
+  process: pipeline
+  project_payload: {}
+  relay: null
+  route_fn: null
+  runtime:
+    max_seq_len: null
+    resources:
+      total_gpu_memory_fraction: null
+    sglang_server_args:
+      mem_fraction_static: null
+    video_fps: null
+  runtime_arg_map: {}
+  stream_done_to_fn: null
+  stream_to: []
+  terminal: false
+  tp_size: 1
+  wait_for: null
+  wait_for_fn: null
+- can_accept_stream_before_payload: false
+  factory: sglang_omni.models.moss_tts.stages.create_vocoder_executor
+  factory_args:
+    dtype: float32
+    gpu_id: 0
+  gpu: 0
+  merge_fn: null
+  name: vocoder
+  next: null
+  parallelism:
+    tp: 1
+  process: pipeline
+  project_payload: {}
+  relay: null
+  route_fn: null
+  runtime:
+    max_seq_len: null
+    resources:
+      total_gpu_memory_fraction: null
+    sglang_server_args:
+      mem_fraction_static: null
+    video_fps: null
+  runtime_arg_map: {}
+  stream_done_to_fn: null
+  stream_to: []
+  terminal: true
+  tp_size: 1
+  wait_for: null
+  wait_for_fn: null
+terminal_stages_fn: null
+
