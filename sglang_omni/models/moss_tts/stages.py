@@ -17,6 +17,7 @@ from sglang_omni.models.moss_tts.payload_types import (
     moss_tts_special_token_defaults,
 )
 from sglang_omni.models.moss_tts.request_builders import (
+    MossReferenceAudioEncoder,
     cleanup_prepared_moss_tts_request,
     make_moss_tts_scheduler_adapters,
     preprocess_moss_tts_payload,
@@ -256,6 +257,7 @@ def create_preprocessing_executor(
     max_concurrency: int = 8,
     encoder_device: str = "cpu",
     encoder_dtype: str = "float32",
+    enable_reference_audio_encoder: bool | None = None,
     enable_encoder_torch_compile: bool = False,
     encoder_torch_compile_mode: str | None = "default",
 ) -> SimpleScheduler:
@@ -263,10 +265,27 @@ def create_preprocessing_executor(
         model_path,
         device=encoder_device,
         dtype=encoder_dtype,
-        enable_encoder_torch_compile=enable_encoder_torch_compile,
+        enable_encoder_torch_compile=False,
         encoder_torch_compile_mode=encoder_torch_compile_mode,
     )
-    set_moss_tts_preprocessing_context(processor=processor)
+    use_reference_audio_encoder = (
+        enable_encoder_torch_compile
+        if enable_reference_audio_encoder is None
+        else enable_reference_audio_encoder
+    )
+    reference_audio_encoder = (
+        MossReferenceAudioEncoder(
+            processor,
+            enable_torch_compile=enable_encoder_torch_compile,
+            torch_compile_mode=encoder_torch_compile_mode,
+        )
+        if use_reference_audio_encoder
+        else None
+    )
+    set_moss_tts_preprocessing_context(
+        processor=processor,
+        reference_audio_encoder=reference_audio_encoder,
+    )
     # Preprocessing is CPU-heavy: every request tokenizes text and encodes the
     # reference audio through the MOSS audio tokenizer. Serial execution
     # (max_concurrency=1) lets the codec encode dominate wall-clock and starves

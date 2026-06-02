@@ -38,6 +38,7 @@ class MossTTSPipelineConfig(PipelineConfig):
             factory_args={
                 "encoder_device": "cuda:0",
                 "encoder_dtype": "bfloat16",
+                "enable_reference_audio_encoder": True,
                 "enable_encoder_torch_compile": True,
                 "encoder_torch_compile_mode": "max-autotune-no-cudagraphs",
             },

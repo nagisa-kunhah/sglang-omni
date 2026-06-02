@@ -9,12 +9,14 @@ import hashlib
 import io
 import os
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from sglang_omni.models.moss_tts.payload_types import MossTTSState
 from sglang_omni.proto import StagePayload
@@ -112,6 +114,7 @@ class MossTTSPreparedRequest:
 @dataclass
 class MossTTSPreprocessingContext:
     processor: Any
+    reference_audio_encoder: "MossReferenceAudioEncoder | None" = None
 
 
 _PREPROCESSING_CONTEXT: MossTTSPreprocessingContext | None = None
@@ -124,12 +127,345 @@ _ABORTED_REQUESTS: set[str] = set()
 _PREPARED_REQUESTS_LOCK = threading.Lock()
 
 
-def set_moss_tts_preprocessing_context(*, processor: Any) -> None:
+class MossReferenceAudioEncoder:
+    """Encode MOSS-TTS reference audio without the processor's Python encode path."""
+
+    def __init__(
+        self,
+        processor: Any,
+        *,
+        enable_torch_compile: bool = False,
+        torch_compile_mode: str | None = "max-autotune-no-cudagraphs",
+    ) -> None:
+        self.processor = processor
+        audio_tokenizer = getattr(processor, "audio_tokenizer", None)
+        if audio_tokenizer is None:
+            raise RuntimeError("MOSS processor has no audio_tokenizer")
+        self.audio_tokenizer = audio_tokenizer
+        self._encode_padded = self._encode_padded_eager
+        if enable_torch_compile:
+            self._patch_fullgraph_type_casts()
+            self._patch_fullgraph_encode_frame()
+            compile_kwargs = {
+                "fullgraph": True,
+                "mode": torch_compile_mode,
+            }
+            self._encode_padded = torch.compile(
+                self._encode_padded_eager,
+                **compile_kwargs,
+            )
+
+    def encode_reference(self, ref_audio: str, n_vq: int | None = None) -> list[torch.Tensor]:
+        wav, sampling_rate = self._load_reference(ref_audio)
+        return self.encode_wavs([wav], sampling_rate, n_vq=n_vq)
+
+    def encode_wavs(
+        self,
+        wav_list: list[torch.Tensor],
+        sampling_rate: int,
+        *,
+        n_vq: int | None = None,
+    ) -> list[torch.Tensor]:
+        if not wav_list:
+            return []
+        device = self._audio_tokenizer_device()
+        dtype = self._audio_tokenizer_dtype()
+        target_sr = int(getattr(self.processor.model_config, "sampling_rate", 24000))
+        normalized: list[torch.Tensor] = []
+        for wav in wav_list:
+            if wav.ndim == 1:
+                wav = wav.unsqueeze(0)
+            if int(wav.shape[0]) > 1:
+                wav = torch.mean(wav, dim=0, keepdim=True)
+            if int(sampling_rate) != target_sr:
+                import torchaudio
+
+                wav = torchaudio.functional.resample(
+                    waveform=wav,
+                    orig_freq=int(sampling_rate),
+                    new_freq=target_sr,
+                )
+            wav = self.processor.loudness_normalize(wav.squeeze(0).to(torch.float32))
+            normalized.append(wav.to(device=device, dtype=dtype))
+
+        max_len = max(int(wav.shape[-1]) for wav in normalized)
+        input_values = torch.zeros(
+            len(normalized),
+            1,
+            max_len,
+            device=device,
+            dtype=dtype,
+        )
+        padding_mask = torch.zeros(
+            len(normalized),
+            max_len,
+            device=device,
+            dtype=torch.bool,
+        )
+        for i, wav in enumerate(normalized):
+            length = int(wav.shape[-1])
+            input_values[i, 0, :length] = wav
+            padding_mask[i, :length] = True
+
+        enc = self._encode_padded(input_values, padding_mask, n_vq)
+        audio_codes = enc.audio_codes
+        audio_codes_lengths = enc.audio_codes_lengths
+        if audio_codes is None or audio_codes_lengths is None:
+            raise RuntimeError(
+                "audio_tokenizer.encode() returned empty outputs "
+                "(audio_codes/audio_codes_lengths)."
+            )
+
+        codes_list: list[torch.Tensor] = []
+        for i in range(int(audio_codes.shape[1])):
+            length_i = int(audio_codes_lengths[i].item())
+            codes_i = (
+                audio_codes[:, i, :length_i]
+                .transpose(0, 1)
+                .contiguous()
+                .to(torch.long)
+                .cpu()
+            )
+            codes_list.append(codes_i)
+        return codes_list
+
+    @torch.no_grad()
+    def _encode_padded_eager(
+        self,
+        input_values: torch.Tensor,
+        padding_mask: torch.Tensor,
+        n_vq: int | None,
+    ) -> Any:
+        dtype = self._audio_tokenizer_dtype()
+        if input_values.is_cuda and dtype in (torch.float16, torch.bfloat16):
+            with torch.autocast(device_type=input_values.device.type, dtype=dtype):
+                return self.audio_tokenizer.encode(
+                    input_values,
+                    padding_mask=padding_mask,
+                    num_quantizers=n_vq,
+                    return_dict=True,
+                )
+        return self.audio_tokenizer.encode(
+            input_values,
+            padding_mask=padding_mask,
+            num_quantizers=n_vq,
+            return_dict=True,
+        )
+
+    def _audio_tokenizer_device(self) -> torch.device:
+        resolver = getattr(self.processor, "_get_audio_tokenizer_device", None)
+        if callable(resolver):
+            return resolver()
+        return next(self.audio_tokenizer.parameters()).device
+
+    def _audio_tokenizer_dtype(self) -> torch.dtype:
+        try:
+            return next(self.audio_tokenizer.parameters()).dtype
+        except StopIteration:
+            return torch.float32
+
+    def _load_reference(self, ref_audio: str) -> tuple[torch.Tensor, int]:
+        match = _DATA_URI_RE.match(ref_audio)
+        if match is not None:
+            raw = base64.b64decode(match.group("data"))
+            return self._decode_audio_file(io.BytesIO(raw))
+        return self._decode_audio_file(ref_audio)
+
+    def _patch_fullgraph_type_casts(self) -> None:
+        """Remove runtime no-op typing casts that Dynamo cannot fullgraph trace."""
+
+        mha_cls = None
+        for module in self.audio_tokenizer.modules():
+            if module.__class__.__name__ == "MossAudioTokenizerMultiheadAttention":
+                mha_cls = module.__class__
+                break
+        if mha_cls is None or getattr(mha_cls, "_sglang_omni_fullgraph_patch", False):
+            return
+
+        globals_ = mha_cls.forward.__globals__
+        apply_weights_per_step = globals_["apply_weights_per_step"]
+        kv_cache_result = globals_["KVCacheResult"]
+        functional = globals_["F"]
+
+        def _complete_kv_no_type_union(self: Any, k: torch.Tensor, v: torch.Tensor) -> Any:
+            state = self._streaming_state
+            if state is None:
+                return kv_cache_result.from_kv(k, v)
+            if state.kv_cache is None:
+                return kv_cache_result.from_kv(k, v)
+            return state.kv_cache.complete(k, v, state.exec_mask)
+
+        def _forward_no_type_union(
+            self: Any,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+        ) -> torch.Tensor:
+            del key, value
+            state = self._streaming_state
+            batch, seq_len = query.shape[:2]
+
+            if state is None:
+                offset = torch.zeros(batch, device=query.device, dtype=torch.long)
+                offset_cpu = 0
+            else:
+                offset = state.offset
+                offset_cpu = state.offset_cpu
+
+            projected = apply_weights_per_step(
+                self.in_projs,
+                self.weights_per_step_schedule,
+                query,
+                offset_cpu,
+            )
+            dim_per_head = self.embed_dim // self.num_heads
+            projected = projected.reshape(
+                batch,
+                seq_len,
+                3,
+                self.num_heads,
+                dim_per_head,
+            ).permute(2, 0, 3, 1, 4)
+            q, k, v = projected[0], projected[1], projected[2]
+
+            if self.rope:
+                q, k = self.rope(q, k, offset, time_before_heads=False)
+
+            k, v, pos_k = self._complete_kv(k, v)
+            pos_k = pos_k[:, None]
+
+            if self.causal:
+                pos_q = offset.view(-1, 1, 1) + torch.arange(
+                    seq_len,
+                    device=q.device,
+                    dtype=torch.long,
+                ).view(-1, 1)
+                delta = pos_q - pos_k
+                attn_bias = (pos_k >= 0) & (delta >= 0)
+                if self.context is not None:
+                    attn_bias = attn_bias & (delta < self.context)
+                attn_bias = attn_bias[:, None]
+            else:
+                attn_bias = None
+
+            x = functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_bias,
+                dropout_p=0.0,
+            )
+            x = x.transpose(1, 2).reshape(batch, seq_len, self.embed_dim)
+            x = apply_weights_per_step(
+                self.out_projs,
+                self.weights_per_step_schedule,
+                x,
+                offset_cpu,
+            )
+
+            if state is not None:
+                state.offset[:] = torch.where(
+                    state.exec_mask,
+                    state.offset + seq_len,
+                    state.offset,
+                )
+                state.offset_cpu += seq_len
+            return x
+
+        mha_cls._complete_kv = _complete_kv_no_type_union
+        mha_cls.forward = _forward_no_type_union
+        mha_cls._sglang_omni_fullgraph_patch = True
+
+    def _patch_fullgraph_encode_frame(self) -> None:
+        tokenizer_cls = self.audio_tokenizer.__class__
+        if getattr(tokenizer_cls, "_sglang_omni_encode_frame_patch", False):
+            return
+        module = sys.modules.get(tokenizer_cls._encode_frame.__module__)
+        output_cls = getattr(module, "MossAudioTokenizerEncoderOutput", None)
+        if output_cls is None:
+            raise RuntimeError(
+                "Cannot patch MOSS audio tokenizer fullgraph casts: "
+                "MossAudioTokenizerEncoderOutput is unavailable"
+            )
+
+        @torch.no_grad()
+        def _encode_frame_no_type_union(
+            self: Any,
+            input_values: torch.Tensor,
+            input_lengths: torch.Tensor | None = None,
+            n_quantizers: int | None = None,
+        ) -> Any:
+            if input_values.dim() == 2:
+                input_values = input_values.unsqueeze(1)
+
+            batch, _, seq_len = input_values.shape
+            device = input_values.device
+
+            if input_lengths is None:
+                input_lengths = torch.full(
+                    (batch,),
+                    seq_len,
+                    device=device,
+                    dtype=torch.long,
+                )
+
+            if seq_len % self.downsample_rate != 0:
+                pad_length = self.downsample_rate - (seq_len % self.downsample_rate)
+                input_values = F.pad(input_values, (0, pad_length))
+
+            encoded, encoded_lengths = input_values, input_lengths
+            for encoder_module in self.encoder:
+                encoded, encoded_lengths = encoder_module(
+                    encoded,
+                    encoded_lengths,
+                )
+
+            quantizer = self.quantizer
+            zq, audio_codes, audio_codes_lengths = quantizer(
+                encoded,
+                encoded_lengths,
+                n_quantizers,
+            )
+            del zq
+
+            return output_cls(
+                audio_codes=audio_codes,
+                audio_codes_lengths=audio_codes_lengths,
+                encoder_hidden_states=encoded,
+            )
+
+        tokenizer_cls._encode_frame = _encode_frame_no_type_union
+        tokenizer_cls._sglang_omni_encode_frame_patch = True
+
+    @staticmethod
+    def _decode_audio_file(source: str | io.BytesIO) -> tuple[torch.Tensor, int]:
+        try:
+            import soundfile as sf
+
+            audio, sample_rate = sf.read(source, dtype="float32", always_2d=True)
+            return torch.from_numpy(audio.T), int(sample_rate)
+        except Exception:
+            if not isinstance(source, str):
+                raise
+            import torchaudio
+
+            wav, sample_rate = torchaudio.load(source)
+            return wav.to(torch.float32), int(sample_rate)
+
+
+def set_moss_tts_preprocessing_context(
+    *,
+    processor: Any,
+    reference_audio_encoder: MossReferenceAudioEncoder | None = None,
+) -> None:
     """Register the upstream MOSS processor used by preprocessing."""
 
     global _PREPROCESSING_CONTEXT
     with _PREPARED_REQUESTS_LOCK:
-        _PREPROCESSING_CONTEXT = MossTTSPreprocessingContext(processor=processor)
+        _PREPROCESSING_CONTEXT = MossTTSPreprocessingContext(
+            processor=processor,
+            reference_audio_encoder=reference_audio_encoder,
+        )
         _PREPARED_REQUESTS.clear()
         _INFLIGHT_REQUESTS.clear()
         _ABORTED_REQUESTS.clear()
@@ -400,11 +736,18 @@ def build_row_cache_key_ids(rows: torch.Tensor) -> list[int]:
     return key_ids
 
 
-def _reference_for_processor(processor: Any, ref_audio: Any | None) -> list[Any] | None:
+def _reference_for_processor(
+    processor: Any,
+    ref_audio: Any | None,
+    *,
+    reference_audio_encoder: MossReferenceAudioEncoder | None = None,
+) -> list[Any] | None:
     if ref_audio is None:
         return None
     if not isinstance(ref_audio, str):
         return [ref_audio]
+    if reference_audio_encoder is not None:
+        return reference_audio_encoder.encode_reference(ref_audio)
     match = _DATA_URI_RE.match(ref_audio)
     if match is None:
         return [ref_audio]
@@ -423,8 +766,17 @@ def _reference_for_processor(processor: Any, ref_audio: Any | None) -> list[Any]
     return [codes]
 
 
-def _build_processor_message(processor: Any, state: MossTTSState) -> dict[str, Any]:
-    reference = _reference_for_processor(processor, state.ref_audio)
+def _build_processor_message(
+    processor: Any,
+    state: MossTTSState,
+    *,
+    reference_audio_encoder: MossReferenceAudioEncoder | None = None,
+) -> dict[str, Any]:
+    reference = _reference_for_processor(
+        processor,
+        state.ref_audio,
+        reference_audio_encoder=reference_audio_encoder,
+    )
     return processor.build_user_message(
         text=state.text,
         reference=reference,
@@ -438,9 +790,14 @@ def _prepare_moss_tts_request(
     payload: StagePayload,
     *,
     processor: Any,
+    reference_audio_encoder: MossReferenceAudioEncoder | None = None,
 ) -> MossTTSPreparedRequest:
     state = build_moss_tts_state(payload)
-    message = _build_processor_message(processor, state)
+    message = _build_processor_message(
+        processor,
+        state,
+        reference_audio_encoder=reference_audio_encoder,
+    )
     batch = processor([[message]], mode="generation")
     input_rows = batch["input_ids"]
     if input_rows.ndim != 3 or int(input_rows.shape[0]) != 1:
@@ -473,7 +830,17 @@ def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
         )
 
     try:
-        prepared = _prepare_moss_tts_request(payload, processor=context.processor)
+        if context.reference_audio_encoder is None:
+            prepared = _prepare_moss_tts_request(
+                payload,
+                processor=context.processor,
+            )
+        else:
+            prepared = _prepare_moss_tts_request(
+                payload,
+                processor=context.processor,
+                reference_audio_encoder=context.reference_audio_encoder,
+            )
     except BaseException:
         with _PREPARED_REQUESTS_LOCK:
             _INFLIGHT_REQUESTS.discard(rid)

@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.layers.sampler import multinomial_with_seed
 
 from sglang_omni.model_runner.base import ModelRunner
@@ -29,12 +30,23 @@ class MossTTSModelRunner(ModelRunner):
         forward_batch: Any,
         schedule_batch: Any,
         requests: list,
-    ) -> None:
+    ) -> Any:
         del schedule_batch
         forward_batch.input_embeds = self._build_prefill_input_embeds(
             forward_batch, requests
         )
-        return None
+        attn_backend = self.tp_worker.model_runner.attn_backend
+        attn_backend.init_forward_metadata(forward_batch)
+        logits_output = self.model(
+            input_ids=forward_batch.input_ids,
+            positions=forward_batch.positions,
+            forward_batch=forward_batch,
+            input_embeds=forward_batch.input_embeds,
+        )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            can_run_cuda_graph=False,
+        )
 
     def before_decode(
         self,
