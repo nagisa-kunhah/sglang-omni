@@ -251,6 +251,80 @@ def test_moss_tts_talker_torch_compile_cli_override_targets_tts_engine() -> None
     assert server_args_overrides["torch_compile_max_bs"] == 4
 
 
+def test_moss_audio_encoder_compile_wraps_encode_and_warms_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.moss_tts import stages
+
+    class FakeAudioTokenizer(torch.nn.Module):
+        def encode(self, value: torch.Tensor) -> torch.Tensor:
+            return value
+
+    class FakeProcessor:
+        def __init__(self) -> None:
+            self.audio_tokenizer = FakeAudioTokenizer()
+            self.warmup_calls = 0
+
+        def encode_audios_from_wav(self, wavs, sample_rate):
+            del sample_rate
+            self.warmup_calls += 1
+            return [self.audio_tokenizer.encode(wavs[0])]
+
+    compile_calls: list[tuple[object, str | None, dict[str, object]]] = []
+
+    def fake_compile(
+        target: object, *, mode: str | None = None, **kwargs: object
+    ) -> object:
+        compile_calls.append((target, mode, kwargs))
+
+        def wrapped(value):
+            return target(value)
+
+        return wrapped
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    processor = FakeProcessor()
+
+    stages._compile_moss_audio_encoder(
+        processor,
+        mode="reduce-overhead",
+    )
+
+    assert len(compile_calls) == 1
+    target, mode, kwargs = compile_calls[0]
+    assert getattr(target, "__self__", None) is processor.audio_tokenizer
+    assert getattr(target, "__name__", "") == "encode"
+    assert mode == "reduce-overhead"
+    assert kwargs == {}
+    assert processor.warmup_calls == 1
+
+
+def test_moss_audio_encoder_compile_failure_restores_encode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.moss_tts import stages
+
+    class FakeAudioTokenizer:
+        def encode(self, value: torch.Tensor) -> torch.Tensor:
+            return value
+
+    class FakeProcessor:
+        def __init__(self) -> None:
+            self.audio_tokenizer = FakeAudioTokenizer()
+
+    def fake_compile(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("compile failed")
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    processor = FakeProcessor()
+    with pytest.raises(RuntimeError, match="torch.compile failed"):
+        stages._compile_moss_audio_encoder(processor, mode="default")
+    assert processor.audio_tokenizer.encode.__func__ is FakeAudioTokenizer.encode
+    value = torch.tensor([1.0])
+    assert torch.equal(processor.audio_tokenizer.encode(value), value)
+
+
 def test_moss_tts_state_round_trip_keeps_tensors_native() -> None:
     codes = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
     state = MossTTSState(
