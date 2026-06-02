@@ -193,9 +193,11 @@ def create_preprocessing_executor(
     max_concurrency: int = 8,
     gpu_id: int | None = None,
     encoder_device: str | None = None,
-    encoder_dtype: str = "bfloat16",
-    enable_encoder_torch_compile: bool = True,
-    encoder_torch_compile_mode: str | None = "max-autotune-no-cudagraphs",
+    encoder_dtype: str = "float32",
+    enable_encoder_torch_compile: bool = False,
+    encoder_torch_compile_fullgraph: bool = False,
+    encoder_torch_compile_mode: str | None = "default",
+    encoder_torch_compile_target: str = "batch_encode",
 ) -> SimpleScheduler:
     if encoder_device is not None:
         effective_device = encoder_device
@@ -213,6 +215,8 @@ def create_preprocessing_executor(
         MossReferenceAudioEncoder(
             processor,
             compile_mode=encoder_torch_compile_mode,
+            compile_fullgraph=encoder_torch_compile_fullgraph,
+            compile_target=encoder_torch_compile_target,
         )
         if enable_encoder_torch_compile
         else None
