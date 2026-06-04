@@ -21,7 +21,6 @@ import json
 import os
 import signal
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -93,7 +92,9 @@ def _wait_ready(base_url: str, proc: subprocess.Popen, timeout_s: float) -> None
     last_error = ""
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            raise RuntimeError(f"server exited during startup with code {proc.returncode}")
+            raise RuntimeError(
+                f"server exited during startup with code {proc.returncode}"
+            )
         try:
             status, body, _ = _request_json(f"{base_url}/health", timeout_s=5)
             if status == 200 and b"healthy" in body:
