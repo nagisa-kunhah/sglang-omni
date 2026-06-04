@@ -6,7 +6,7 @@ default. Do not run it while the machine is reserved for another experiment.
 
 It measures only the reference-audio preprocessing path:
 
-    processor.encode_audios_from_wav -> audio_tokenizer.batch_encode -> _encode_frame
+    processor.encode_audios_from_wav -> audio_tokenizer.batch_encode -> _encode_frame -> quantizer.forward
 
 Example:
 
@@ -144,8 +144,7 @@ def _run_case(
         encoder = MossReferenceAudioEncoder(
             processor,
             compile_mode=args.compile_mode,
-            compile_fullgraph=args.compile_fullgraph,
-            compile_target=args.compile_target,
+            compile_warmup_seconds=args.compile_warmup_seconds,
         )
         compile_s = time.perf_counter() - start
         encode_fn = lambda: encoder._encode_wav(wav, sample_rate)
@@ -206,9 +205,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ref-audio", default="/tmp/moss_ref_3s.wav")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--encoder-dtype", default="float32")
-    parser.add_argument("--compile-mode", default="max-autotune-no-cudagraphs")
-    parser.add_argument("--compile-fullgraph", action="store_true")
-    parser.add_argument("--compile-target", default="batch_encode")
+    parser.add_argument("--compile-mode", default="default")
+    parser.add_argument(
+        "--compile-warmup-seconds",
+        type=float,
+        nargs="*",
+        default=[1.0],
+    )
     parser.add_argument("--prewarm-requests", type=int, default=0)
     parser.add_argument("--cold-requests", type=int, default=1)
     parser.add_argument("--warm-requests", type=int, default=5)

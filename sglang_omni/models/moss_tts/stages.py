@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 
@@ -174,6 +174,19 @@ def _load_moss_processor(
     return processor
 
 
+def _resolve_encoder_device(encoder_device: str, gpu_id: int | None) -> str:
+    normalized = encoder_device.lower()
+    if normalized == "cpu":
+        return "cpu"
+    if normalized == "gpu":
+        return f"cuda:{gpu_id if gpu_id is not None else 0}"
+    if normalized == "cuda" or normalized.startswith("cuda:"):
+        return encoder_device
+    raise RuntimeError(
+        "MOSS-TTS encoder_device must be 'cpu', 'gpu', 'cuda', or 'cuda:<index>'"
+    )
+
+
 def _build_usage(state: MossTTSState) -> dict[str, Any] | None:
     if not (state.prompt_tokens or state.completion_tokens or state.engine_time_s):
         return None
@@ -192,31 +205,29 @@ def create_preprocessing_executor(
     *,
     max_concurrency: int = 8,
     gpu_id: int | None = None,
-    encoder_device: str | None = None,
-    encoder_dtype: str = "float32",
+    encoder_device: str = "cpu",
     enable_encoder_torch_compile: bool = False,
-    encoder_torch_compile_fullgraph: bool = False,
     encoder_torch_compile_mode: str | None = "default",
-    encoder_torch_compile_target: str = "batch_encode",
+    encoder_torch_compile_warmup_seconds: Sequence[float] | None = None,
 ) -> SimpleScheduler:
-    if encoder_device is not None:
-        effective_device = encoder_device
-    elif enable_encoder_torch_compile:
-        effective_device = f"cuda:{gpu_id if gpu_id is not None else 0}"
-    else:
-        effective_device = "cpu"
+    effective_device = _resolve_encoder_device(encoder_device, gpu_id)
+    if enable_encoder_torch_compile and effective_device == "cpu":
+        raise RuntimeError(
+            "MOSS-TTS encoder torch.compile requires encoder_device='gpu' "
+            "or encoder_device='cuda:<index>'"
+        )
 
     processor = _load_moss_processor(
         model_path,
         device=effective_device,
-        dtype=encoder_dtype,
+        dtype="float32",
     )
     reference_audio_encoder = (
         MossReferenceAudioEncoder(
             processor,
+            enable_torch_compile=True,
             compile_mode=encoder_torch_compile_mode,
-            compile_fullgraph=encoder_torch_compile_fullgraph,
-            compile_target=encoder_torch_compile_target,
+            compile_warmup_seconds=encoder_torch_compile_warmup_seconds,
         )
         if enable_encoder_torch_compile
         else None

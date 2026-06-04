@@ -136,15 +136,17 @@ def test_moss_tts_config_and_registry_contracts() -> None:
         stage for stage in config.stages if stage.name == "preprocessing"
     )
     assert preprocessing.gpu is None
+    assert preprocessing.factory_args["encoder_device"] == "cpu"
     assert preprocessing.factory_args["enable_encoder_torch_compile"] is False
-    assert preprocessing.factory_args["encoder_dtype"] == "float32"
-    assert preprocessing.factory_args["encoder_torch_compile_fullgraph"] is False
-    assert (
-        preprocessing.factory_args["encoder_torch_compile_mode"]
-        == "default"
-    )
-    assert preprocessing.factory_args["encoder_torch_compile_target"] == "batch_encode"
-    assert "encoder_device" not in preprocessing.factory_args
+    assert preprocessing.factory_args["encoder_torch_compile_mode"] == "default"
+    assert preprocessing.factory_args["encoder_torch_compile_warmup_seconds"] == [1.0]
+    for removed_arg in (
+        "encoder_dtype",
+        "encoder_torch_compile_fullgraph",
+        "encoder_torch_compile_target",
+        "encoder_torch_compile_dynamic",
+    ):
+        assert removed_arg not in preprocessing.factory_args
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("MossTTSDelayModel")
         is MossTTSPipelineConfig
@@ -273,40 +275,47 @@ def test_moss_tts_talker_torch_compile_cli_override_targets_tts_engine() -> None
     assert server_args_overrides["torch_compile_max_bs"] == 4
 
 
-def test_moss_audio_encoder_compile_wraps_encode_frame_and_warms_up(
+def test_moss_audio_encoder_compile_wraps_module_forward_and_warms_up(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from sglang_omni.models.moss_tts.reference_audio_encoder import (
         MossReferenceAudioEncoder,
     )
 
+    class FakeQuantizer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+            self.compiled_calls = 0
+            self.last_n_quantizers = None
+
+        @torch.no_grad()
+        def forward(self, z, input_length, n_quantizers=None):
+            del input_length
+            self.calls += 1
+            self.last_n_quantizers = n_quantizers
+            return z
+
     class FakeAudioTokenizer(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.frame_calls = 0
-            self.compiled_batch_calls = 0
-
-        def encode(self, value: torch.Tensor) -> torch.Tensor:
-            del value
-            raise AssertionError("encode should not be compiled or called")
-
-        @torch.no_grad()
-        def _encode_frame(self, value: torch.Tensor) -> torch.Tensor:
-            self.frame_calls += 1
-            return value
+            self.quantizer = FakeQuantizer()
 
         @torch.no_grad()
         def batch_encode(self, wavs):
-            return [self._encode_frame(wav) for wav in wavs]
+            input_length = torch.tensor([wavs[0].shape[-1]])
+            return [self.quantizer(wavs[0], input_length, None)]
 
     class FakeProcessor:
         def __init__(self) -> None:
             self.audio_tokenizer = FakeAudioTokenizer()
             self.warmup_calls = 0
+            self.warmup_shapes = []
 
         def encode_audios_from_wav(self, wavs, sample_rate):
             del sample_rate
             self.warmup_calls += 1
+            self.warmup_shapes.append(tuple(wavs[0].shape))
             return self.audio_tokenizer.batch_encode(wavs)
 
     compile_calls: list[tuple[object, str | None, dict[str, object]]] = []
@@ -317,7 +326,7 @@ def test_moss_audio_encoder_compile_wraps_encode_frame_and_warms_up(
         compile_calls.append((target, mode, kwargs))
 
         def wrapped(*args, **kwargs):
-            processor.audio_tokenizer.compiled_batch_calls += 1
+            processor.audio_tokenizer.quantizer.compiled_calls += 1
             return target(*args, **kwargs)
 
         return wrapped
@@ -325,41 +334,49 @@ def test_moss_audio_encoder_compile_wraps_encode_frame_and_warms_up(
     monkeypatch.setattr(torch, "compile", fake_compile)
     processor = FakeProcessor()
 
-    encoder = MossReferenceAudioEncoder(
+    MossReferenceAudioEncoder(
         processor,
         compile_mode="reduce-overhead",
-        compile_fullgraph=False,
-        compile_target="batch_encode",
+        compile_warmup_seconds=[1.0, 3.0],
     )
 
-    assert encoder.processor is processor
     assert len(compile_calls) == 1
     target, mode, kwargs = compile_calls[0]
-    assert getattr(target, "__self__", None) is processor.audio_tokenizer
-    assert getattr(target, "__name__", "") == "batch_encode"
-    assert not hasattr(target, "__wrapped__")
+    assert getattr(target, "__name__", "") == "forward"
     assert mode == "reduce-overhead"
-    assert kwargs == {"fullgraph": False}
-    assert processor.warmup_calls == 1
-    assert processor.audio_tokenizer.compiled_batch_calls == 1
-    assert processor.audio_tokenizer.frame_calls == 1
+    assert kwargs == {
+        "fullgraph": False,
+        "dynamic": False,
+    }
+    assert processor.warmup_calls == 2
+    assert processor.warmup_shapes == [(1, 24000), (1, 72000)]
+    assert processor.audio_tokenizer.quantizer.calls == 2
+    assert processor.audio_tokenizer.quantizer.compiled_calls == 2
+    assert processor.audio_tokenizer.quantizer.last_n_quantizers is None
 
 
-def test_moss_audio_encoder_compile_failure_restores_encode_frame(
+def test_moss_audio_encoder_compile_module_failure_restores_forward(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from sglang_omni.models.moss_tts.reference_audio_encoder import (
         MossReferenceAudioEncoder,
     )
 
-    class FakeAudioTokenizer:
+    class FakeQuantizer(torch.nn.Module):
         @torch.no_grad()
-        def _encode_frame(self, value: torch.Tensor) -> torch.Tensor:
-            return value
+        def forward(self, z, input_length, n_quantizers=None):
+            del input_length, n_quantizers
+            return z
+
+    class FakeAudioTokenizer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.quantizer = FakeQuantizer()
 
         @torch.no_grad()
         def batch_encode(self, wavs):
-            return [self._encode_frame(wav) for wav in wavs]
+            input_length = torch.tensor([wavs[0].shape[-1]])
+            return [self.quantizer(wavs[0], input_length, None)]
 
     class FakeProcessor:
         def __init__(self) -> None:
@@ -380,16 +397,43 @@ def test_moss_audio_encoder_compile_failure_restores_encode_frame(
 
     monkeypatch.setattr(torch, "compile", fake_compile)
     processor = FakeProcessor()
+
     with pytest.raises(RuntimeError, match="torch.compile failed"):
-        MossReferenceAudioEncoder(
-            processor,
-            compile_mode="default",
-            compile_fullgraph=False,
-            compile_target="batch_encode",
-        )
-    assert "batch_encode" not in processor.audio_tokenizer.__dict__
+        MossReferenceAudioEncoder(processor)
+
+    assert "forward" not in processor.audio_tokenizer.quantizer.__dict__
     value = torch.tensor([1.0])
     assert torch.equal(processor.audio_tokenizer.batch_encode([value])[0], value)
+
+
+def test_moss_audio_encoder_compile_disabled_uses_eager_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.moss_tts.reference_audio_encoder import (
+        MossReferenceAudioEncoder,
+    )
+
+    class FakeProcessor:
+        def __init__(self) -> None:
+            self.audio_tokenizer = object()
+            self.calls = 0
+
+        def encode_audios_from_wav(self, wavs, sample_rate):
+            del sample_rate
+            self.calls += 1
+            return [wavs[0]]
+
+    def fake_compile(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("torch.compile should not be called")
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    processor = FakeProcessor()
+    encoder = MossReferenceAudioEncoder(processor, enable_torch_compile=False)
+
+    value = torch.tensor([[1.0]])
+    assert torch.equal(encoder._encode_wav(value, 24000), value)
+    assert processor.calls == 1
 
 
 def test_moss_preprocessing_encoder_device_resolution(
@@ -401,10 +445,15 @@ def test_moss_preprocessing_encoder_device_resolution(
 
     class FakeReferenceAudioEncoder:
         def __init__(
-            self, processor, *, compile_mode, compile_fullgraph, compile_target
+            self,
+            processor,
+            *,
+            enable_torch_compile,
+            compile_mode,
+            compile_warmup_seconds,
         ):
             captured.setdefault("wrappers", []).append(
-                (processor, compile_mode, compile_fullgraph, compile_target)
+                (processor, enable_torch_compile, compile_mode, compile_warmup_seconds)
             )
 
     def fake_load(model_path, *, device, dtype):
@@ -417,35 +466,48 @@ def test_moss_preprocessing_encoder_device_resolution(
     stages.create_preprocessing_executor(
         "model",
         gpu_id=0,
-        encoder_device=None,
+        encoder_device="gpu",
+        enable_encoder_torch_compile=True,
+        encoder_torch_compile_mode="reduce-overhead",
+        encoder_torch_compile_warmup_seconds=[1.0, 3.0],
+    )
+    stages.create_preprocessing_executor(
+        "model",
+        encoder_device="cuda:2",
         enable_encoder_torch_compile=True,
     )
     stages.create_preprocessing_executor(
         "model",
         gpu_id=2,
-        encoder_device=None,
-        enable_encoder_torch_compile=True,
-    )
-    stages.create_preprocessing_executor(
-        "model",
-        gpu_id=2,
-        encoder_device=None,
+        encoder_device="gpu",
         enable_encoder_torch_compile=False,
     )
     stages.create_preprocessing_executor(
         "model",
         gpu_id=2,
         encoder_device="cpu",
-        enable_encoder_torch_compile=True,
+        enable_encoder_torch_compile=False,
     )
+    with pytest.raises(RuntimeError, match="requires encoder_device='gpu'"):
+        stages.create_preprocessing_executor(
+            "model",
+            encoder_device="cpu",
+            enable_encoder_torch_compile=True,
+        )
 
     assert captured["loads"] == [
         ("model", "cuda:0", "float32"),
         ("model", "cuda:2", "float32"),
-        ("model", "cpu", "float32"),
+        ("model", "cuda:2", "float32"),
         ("model", "cpu", "float32"),
     ]
-    assert len(captured["wrappers"]) == 3
+    assert len(captured["wrappers"]) == 2
+    assert captured["wrappers"][0][1:] == (
+        True,
+        "reduce-overhead",
+        [1.0, 3.0],
+    )
+    assert captured["wrappers"][1][1:] == (True, "default", None)
 
 
 def test_moss_tts_state_round_trip_keeps_tensors_native() -> None:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paired MOSS-TTS `_encode_frame` compile benchmark helper.
+"""Paired MOSS-TTS reference encoder compile benchmark helper.
 
 This script intentionally starts real `sgl-omni serve` processes. Do not run it
 while the machine is reserved for another experiment.
@@ -65,20 +65,20 @@ def _write_config(
     model_path: str,
     output_path: Path,
     compile_enabled: bool,
-    fullgraph: bool,
+    encoder_device: str,
     compile_mode: str | None,
-    compile_target: str,
-    dtype: str,
+    compile_warmup_seconds: list[float],
 ) -> None:
     cfg = MossTTSPipelineConfig(model_path=model_path)
     for stage in cfg.stages:
         if stage.name != "preprocessing":
             continue
-        stage.factory_args["encoder_dtype"] = dtype
+        stage.factory_args["encoder_device"] = encoder_device
         stage.factory_args["enable_encoder_torch_compile"] = compile_enabled
-        stage.factory_args["encoder_torch_compile_fullgraph"] = fullgraph
         stage.factory_args["encoder_torch_compile_mode"] = compile_mode
-        stage.factory_args["encoder_torch_compile_target"] = compile_target
+        stage.factory_args["encoder_torch_compile_warmup_seconds"] = (
+            compile_warmup_seconds
+        )
     output_path.write_text(yaml.safe_dump(cfg.model_dump(mode="json")))
 
 
@@ -297,10 +297,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-timeout", type=float, default=900)
     parser.add_argument("--cold-requests", type=int, default=1)
     parser.add_argument("--warm-requests", type=int, default=5)
-    parser.add_argument("--encoder-dtype", default="float32")
+    parser.add_argument("--compile-on-encoder-device", default="gpu")
+    parser.add_argument("--compile-off-encoder-device", default="cpu")
     parser.add_argument("--compile-mode", default="default")
-    parser.add_argument("--compile-fullgraph", action="store_true")
-    parser.add_argument("--compile-target", default="batch_encode")
+    parser.add_argument(
+        "--compile-warmup-seconds",
+        type=float,
+        nargs="*",
+        default=[1.0],
+    )
     parser.add_argument(
         "--prepare-only",
         action="store_true",
@@ -328,19 +333,17 @@ def main() -> int:
         model_path=args.model_path,
         output_path=compile_on_config,
         compile_enabled=True,
-        fullgraph=bool(args.compile_fullgraph),
+        encoder_device=args.compile_on_encoder_device,
         compile_mode=args.compile_mode,
-        compile_target=args.compile_target,
-        dtype=args.encoder_dtype,
+        compile_warmup_seconds=args.compile_warmup_seconds,
     )
     _write_config(
         model_path=args.model_path,
         output_path=compile_off_config,
         compile_enabled=False,
-        fullgraph=False,
+        encoder_device=args.compile_off_encoder_device,
         compile_mode=args.compile_mode,
-        compile_target=args.compile_target,
-        dtype=args.encoder_dtype,
+        compile_warmup_seconds=args.compile_warmup_seconds,
     )
 
     if args.prepare_only:
