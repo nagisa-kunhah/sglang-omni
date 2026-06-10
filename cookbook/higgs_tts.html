@@ -51,6 +51,7 @@
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'cookbook/higgs_tts';</script>
     <script src="../_static/js/qwen3_omni_server_generator.js?v=621ec60e"></script>
+    <script src="../_static/js/ming_omni_server_generator.js?v=694b1473"></script>
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
@@ -59,7 +60,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="Jun 04, 2026"/>
+    <meta name="docbuild:last-update" content="Jun 10, 2026"/>
   </head>
   
   
@@ -166,6 +167,7 @@
 <li class="toctree-l1"><a class="reference internal" href="qwen3_asr.html">Qwen3-ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="whisper_asr.html">Whisper ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="qwen3_omni.html">Qwen3-Omni</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ming_omni.html">Ming-Omni</a></li>
 <li class="toctree-l1"><a class="reference internal" href="llada2_uni.html">LLaDA2.0-Uni</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">General Usage</span></p>
@@ -412,11 +414,6 @@
             </div>
             <nav aria-label="Page">
                 <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#supported-languages">Supported Languages</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#wer-cer-under-5-polished-production-quality-83">WER/CER under 5 — polished, production-quality (83)</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#wer-cer-between-5-and-10-usable-but-less-polished-17">WER/CER between 5 and 10 — usable, but less polished (17)</a></li>
-</ul>
-</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#evaluation-benchmarks">Evaluation Benchmarks</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multilingual-voice-clone">Multilingual Voice Clone</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#emergent-tts">Emergent TTS</a></li>
@@ -455,7 +452,7 @@
   <section class="tex2jax_ignore mathjax_ignore" id="higgs-tts">
 <h1>Higgs TTS<a class="headerlink" href="#higgs-tts" title="Link to this heading">#</a></h1>
 <p><a class="reference external" href="https://huggingface.co/bosonai/higgs-audio-v3-tts-4b">Higgs Audio v3 TTS</a>
-is a text-to-speech model from Boson AI. It generates <strong>24 kHz speech</strong> and supports <strong>100 languages</strong>, voice cloning from a reference clip, and fine-grained <strong>inline control</strong> over emotion, style, sound effects, and prosody.</p>
+is a text-to-speech model from Boson AI. It generates <strong>24 kHz speech</strong> and supports <a class="reference external" href="https://huggingface.co/bosonai/higgs-audio-v3-tts-4b#supported-languages"><strong>100+ languages</strong></a>, voice cloning from a reference clip, and fine-grained <strong>inline control</strong> over emotion, style, sound effects, and prosody.</p>
 <p><img alt="Higgs Audio v3 Generation Architecture" src="../_images/higgs-architecture.png" /></p>
 <p>Higgs autoregressive decoder consumes interleaved text and audio tokens. Audio is encoded by the <strong>Higgs Tokenizer</strong> into 8 codebooks at 25 fps, staggered via a <strong>delay pattern</strong>, then mapped to backbone hidden states through a <strong>multi-codebook fused embedding</strong>. Output codes pass through a <strong>multi-codebook fused head</strong>, are de-delayed, and decoded back to waveform. Multi-turn generation interleaves <code class="docutils literal notranslate"><span class="pre">&lt;|text|&gt;…&lt;|audio|&gt;…</span></code> chunks so each new chunk is grounded on reference + prior chunks.</p>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -486,18 +483,6 @@ is a text-to-speech model from Boson AI. It generates <strong>24 kHz speech</str
 </tbody>
 </table>
 </div>
-<section id="supported-languages">
-<h2>Supported Languages<a class="headerlink" href="#supported-languages" title="Link to this heading">#</a></h2>
-<p>The model reaches <strong>single-digit WER/CER on 100 languages</strong>, which split into two tiers.</p>
-<section id="wer-cer-under-5-polished-production-quality-83">
-<h3>WER/CER under 5 — polished, production-quality (83)<a class="headerlink" href="#wer-cer-under-5-polished-production-quality-83" title="Link to this heading">#</a></h3>
-<p>🇿🇦 Afrikaans · 🇸🇦🇪🇬 Arabic · 🇦🇲 Armenian · 🇮🇳 Assamese · 🇪🇸 Asturian · 🇦🇿 Azerbaijani · 🇷🇺 Bashkir · 🇪🇸 Basque · 🇧🇾 Belarusian · 🇧🇩🇮🇳 Bengali · 🇧🇦 Bosnian · 🇧🇬 Bulgarian · 🇪🇸 Catalan · 🇵🇭 Cebuano · 🇮🇶 Central Kurdish · 🇨🇳 Chinese · 🇭🇷 Croatian · 🇨🇿 Czech · 🇩🇰 Danish · 🇳🇱🇧🇪 Dutch · 🇷🇺 Eastern Mari · 🇺🇸🇬🇧🇦🇺 English · 🌐 Esperanto · 🇪🇪 Estonian · 🇫🇮 Finnish · 🇫🇷🇨🇦 French · 🇪🇸 Galician · 🇬🇪 Georgian · 🇩🇪🇦🇹 German · 🇬🇷 Greek · 🇮🇳 Gujarati · 🇭🇹 Haitian Creole · 🇳🇬 Hausa · 🇮🇱 Hebrew · 🇮🇳 Hindi · 🇭🇺 Hungarian · 🇮🇩 Indonesian · 🇮🇹 Italian · 🇮🇩 Javanese · 🇮🇳 Kannada · 🇰🇿 Kazakh · 🇷🇼 Kinyarwanda · 🇰🇬 Kyrgyz · 🇱🇻 Latvian · 🇨🇩 Lingala · 🇱🇹 Lithuanian · 🇰🇪 Luo · 🇲🇰 Macedonian · 🇲🇾🇮🇩 Malay · 🇮🇳 Malayalam · 🇲🇹 Maltese · 🇳🇿 Māori · 🇮🇳 Marathi · 🇲🇳 Mongolian · 🇳🇵 Nepali · 🇳🇴 Norwegian · 🇫🇷 Occitan · 🇮🇷🇦🇫 Persian · 🇵🇱 Polish · 🇵🇹🇧🇷 Portuguese · 🇷🇴 Romanian · 🇷🇺 Russian · 🇿🇦 Sepedi · 🇷🇸 Serbian · 🇿🇼 Shona · 🇸🇰 Slovak · 🇸🇮 Slovene · 🇪🇸🇲🇽 Spanish · 🇹🇿🇰🇪 Swahili · 🇸🇪 Swedish · 🇵🇭 Tagalog · 🇹🇯 Tajik · 🇮🇳🇱🇰 Tamil · 🇮🇳 Telugu · 🇹🇷 Turkish · 🇺🇦 Ukrainian · 🇵🇰🇮🇳 Urdu · 🇨🇳 Uyghur · 🇺🇿 Uzbek · 🇻🇳 Vietnamese · 🇿🇦 Xhosa · 🇿🇦 Zulu · 🇰🇷 Korean</p>
-</section>
-<section id="wer-cer-between-5-and-10-usable-but-less-polished-17">
-<h3>WER/CER between 5 and 10 — usable, but less polished (17)<a class="headerlink" href="#wer-cer-between-5-and-10-usable-but-less-polished-17" title="Link to this heading">#</a></h3>
-<p>🇦🇱 Albanian · 🇲🇼🇿🇲 Chichewa/Nyanja · 🇮🇳🇵🇰 Eastern Punjabi · 🇺🇬 Ganda · 🇮🇸 Icelandic · 🇮🇪 Irish · 🇩🇿 Kabyle · 🇨🇻 Kabuverdianu · 🇰🇪 Kamba · 🇻🇦 Latin · 🇱🇺 Luxembourgish · 🇪🇹🇰🇪 Oromo · 🇦🇫🇵🇰 Pashto · 🇵🇰🇮🇳 Sindhi · 🇸🇴 Somali · 🇦🇴 Umbundu · 🇬🇧 Welsh</p>
-</section>
-</section>
 <section id="evaluation-benchmarks">
 <h2>Evaluation Benchmarks<a class="headerlink" href="#evaluation-benchmarks" title="Link to this heading">#</a></h2>
 <section id="multilingual-voice-clone">
@@ -1330,11 +1315,6 @@ onomatopoeia gives the model the acoustic cue to realize the effect.</p></li>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#supported-languages">Supported Languages</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#wer-cer-under-5-polished-production-quality-83">WER/CER under 5 — polished, production-quality (83)</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#wer-cer-between-5-and-10-usable-but-less-polished-17">WER/CER between 5 and 10 — usable, but less polished (17)</a></li>
-</ul>
-</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#evaluation-benchmarks">Evaluation Benchmarks</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multilingual-voice-clone">Multilingual Voice Clone</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#emergent-tts">Emergent TTS</a></li>
@@ -1392,7 +1372,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jun 04, 2026.
+  Last updated on Jun 10, 2026.
   <br/>
 </p>
   </div>
