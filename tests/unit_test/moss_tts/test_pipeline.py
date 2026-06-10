@@ -119,6 +119,79 @@ def make_payload(
     )
 
 
+def make_moss_sample_runner():
+    from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
+
+    cfg = SimpleNamespace(
+        pad_token_id=0,
+        audio_start_token_id=10,
+        audio_end_token_id=11,
+        audio_assistant_gen_slot_token_id=12,
+        audio_assistant_delay_slot_token_id=13,
+        audio_pad_code=4,
+        im_end_token_id=14,
+    )
+    runner = MossTTSModelRunner.__new__(MossTTSModelRunner)
+    runner.model = SimpleNamespace(
+        config=cfg,
+        hidden_size=3,
+        device=torch.device("cpu"),
+        _prepare_multi_modal_inputs=lambda rows: rows.to(torch.float32)[:, :3],
+    )
+    return runner, cfg
+
+
+def make_moss_sample_data(**overrides) -> SimpleNamespace:
+    values = dict(
+        audio_length=0,
+        delayed_length=_INF_DELAY,
+        is_audio=False,
+        generation_steps=0,
+        sampling_seed=0,
+        text_temperature=0.0,
+        text_top_p=1.0,
+        text_top_k=-1,
+        audio_temperature=0.0,
+        audio_top_p=1.0,
+        audio_top_k=-1,
+        audio_repetition_penalty=1.0,
+        prompt_rows=None,
+        output_rows=[],
+        pending_feedback_queue=[],
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def clone_moss_data(data: SimpleNamespace) -> SimpleNamespace:
+    cloned = {}
+    for key, value in data.__dict__.items():
+        if isinstance(value, torch.Tensor):
+            cloned[key] = value.clone()
+        elif isinstance(value, list):
+            cloned[key] = [
+                item.clone() if isinstance(item, torch.Tensor) else item
+                for item in value
+            ]
+        else:
+            cloned[key] = value
+    return SimpleNamespace(**cloned)
+
+
+def clone_channel_logits(channel_logits: list[torch.Tensor]) -> list[torch.Tensor]:
+    return [logits.clone() for logits in channel_logits]
+
+
+def assert_moss_sample_data_equal(
+    data_ref: SimpleNamespace,
+    data_cg: SimpleNamespace,
+) -> None:
+    assert torch.equal(data_ref.delay_state, data_cg.delay_state)
+    assert data_ref.audio_length == data_cg.audio_length
+    assert data_ref.delayed_length == data_cg.delayed_length
+    assert data_ref.is_audio == data_cg.is_audio
+
+
 def test_moss_tts_config_and_registry_contracts() -> None:
     config = MossTTSPipelineConfig(model_path="model")
     assert [stage.name for stage in config.stages] == [
@@ -584,6 +657,262 @@ def test_moss_delay_runner_samples_audio_and_appends_feedback() -> None:
     assert text_token == cfg.audio_assistant_gen_slot_token_id
     assert audio_tokens.tolist() == [2, cfg.audio_pad_code]
     assert data.audio_length == 2
+
+
+def test_moss_sample_rows_cuda_graph_does_not_call_reference_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
+
+    runner, cfg = make_moss_sample_runner()
+    data = make_moss_sample_data()
+    text_logits = torch.full((1, 20), -100.0)
+    text_logits[0, cfg.audio_start_token_id] = 10.0
+    audio0_logits = torch.tensor([[-1.0, 0.0, 5.0, 1.0, -100.0]])
+    audio1_logits = torch.tensor([[-1.0, 6.0, 0.0, 1.0, -100.0]])
+
+    def fail_sample_rows(self, channel_logits, datas, *, n_vq):
+        del self, channel_logits, datas, n_vq
+        raise AssertionError("_sample_rows must not be called")
+
+    monkeypatch.setattr(MossTTSModelRunner, "_sample_rows", fail_sample_rows)
+
+    rows = runner._sample_rows_cuda_graph(
+        [text_logits, audio0_logits, audio1_logits],
+        [data],
+        n_vq=2,
+    )
+
+    assert rows.shape == (1, 3)
+
+
+def test_moss_sample_rows_cuda_graph_matches_reference_single_request_greedy() -> None:
+    runner, cfg = make_moss_sample_runner()
+    data_ref = make_moss_sample_data()
+    data_cg = clone_moss_data(data_ref)
+
+    text_logits = torch.full((1, 20), -100.0)
+    text_logits[0, cfg.audio_start_token_id] = 10.0
+    audio0_logits = torch.tensor([[-1.0, 0.0, 5.0, 1.0, -100.0]])
+    audio1_logits = torch.tensor([[-1.0, 6.0, 0.0, 1.0, -100.0]])
+    channel_logits = [text_logits, audio0_logits, audio1_logits]
+
+    rows_ref = runner._sample_rows(
+        clone_channel_logits(channel_logits),
+        [data_ref],
+        n_vq=2,
+    )
+    rows_cg = runner._sample_rows_cuda_graph(
+        clone_channel_logits(channel_logits),
+        [data_cg],
+        n_vq=2,
+    )
+
+    assert torch.equal(rows_ref, rows_cg)
+    assert rows_ref[0].tolist() == [
+        cfg.audio_start_token_id,
+        cfg.audio_pad_code,
+        cfg.audio_pad_code,
+    ]
+    assert_moss_sample_data_equal(data_ref, data_cg)
+
+    data_ref.generation_steps = 1
+    data_cg.generation_steps = 1
+    text_logits = torch.full((1, 20), -100.0)
+    text_logits[0, cfg.audio_assistant_gen_slot_token_id] = 10.0
+    channel_logits = [text_logits, audio0_logits, audio1_logits]
+
+    rows_ref = runner._sample_rows(
+        clone_channel_logits(channel_logits),
+        [data_ref],
+        n_vq=2,
+    )
+    rows_cg = runner._sample_rows_cuda_graph(
+        clone_channel_logits(channel_logits),
+        [data_cg],
+        n_vq=2,
+    )
+
+    assert torch.equal(rows_ref, rows_cg)
+    assert rows_ref[0].tolist() == [
+        cfg.audio_assistant_gen_slot_token_id,
+        2,
+        cfg.audio_pad_code,
+    ]
+    assert_moss_sample_data_equal(data_ref, data_cg)
+
+
+def test_moss_sample_rows_cuda_graph_matches_reference_batched_padding() -> None:
+    runner, cfg = make_moss_sample_runner()
+    datas_ref = [
+        make_moss_sample_data(generation_steps=3),
+        make_moss_sample_data(
+            audio_length=2,
+            delayed_length=0,
+            is_audio=True,
+            generation_steps=4,
+        ),
+        make_moss_sample_data(
+            audio_length=2,
+            delayed_length=2,
+            is_audio=True,
+            generation_steps=5,
+        ),
+    ]
+    datas_cg = [clone_moss_data(data) for data in datas_ref]
+
+    text_logits = torch.full((3, 20), -100.0)
+    text_logits[0, cfg.audio_start_token_id] = 9.0
+    text_logits[1, cfg.audio_assistant_delay_slot_token_id] = 8.0
+    text_logits[2, cfg.audio_assistant_gen_slot_token_id] = 7.0
+    audio0_logits = torch.tensor(
+        [
+            [-1.0, 0.0, 5.0, 1.0, -100.0],
+            [-1.0, 0.0, 4.0, 1.0, -100.0],
+            [-1.0, 6.0, 0.0, 1.0, -100.0],
+        ]
+    )
+    audio1_logits = torch.tensor(
+        [
+            [-1.0, 6.0, 0.0, 1.0, -100.0],
+            [-1.0, 5.0, 0.0, 1.0, -100.0],
+            [-1.0, 0.0, 5.0, 1.0, -100.0],
+        ]
+    )
+    channel_logits = [text_logits, audio0_logits, audio1_logits]
+
+    rows_ref = runner._sample_rows(
+        clone_channel_logits(channel_logits),
+        datas_ref,
+        n_vq=2,
+    )
+    rows_cg = runner._sample_rows_cuda_graph(
+        clone_channel_logits(channel_logits),
+        datas_cg,
+        n_vq=2,
+    )
+
+    assert rows_cg.shape == (3, 3)
+    assert torch.equal(rows_ref, rows_cg)
+    for data_ref, data_cg in zip(datas_ref, datas_cg, strict=True):
+        assert_moss_sample_data_equal(data_ref, data_cg)
+
+
+@pytest.mark.parametrize("case_seed", range(16))
+def test_moss_sample_rows_cuda_graph_matches_reference_seeded_sampling(
+    case_seed: int,
+) -> None:
+    runner, cfg = make_moss_sample_runner()
+    datas_ref = [
+        make_moss_sample_data(
+            generation_steps=6 + case_seed,
+            sampling_seed=123 + case_seed * 17,
+            text_temperature=1.3,
+            text_top_p=0.9,
+            text_top_k=8,
+            audio_temperature=1.4,
+            audio_top_p=0.8,
+            audio_top_k=3,
+        ),
+        make_moss_sample_data(
+            audio_length=2,
+            delayed_length=_INF_DELAY,
+            is_audio=True,
+            generation_steps=9 + case_seed,
+            sampling_seed=987 + case_seed * 31,
+            text_temperature=1.1,
+            text_top_p=1.0,
+            text_top_k=2,
+            audio_temperature=1.6,
+            audio_top_p=0.95,
+            audio_top_k=4,
+        ),
+    ]
+    datas_cg = [clone_moss_data(data) for data in datas_ref]
+
+    generator = torch.Generator().manual_seed(case_seed)
+    text_logits = torch.randn((2, 20), generator=generator)
+    text_logits[:, cfg.pad_token_id] = -100.0
+    text_logits[:, cfg.audio_end_token_id] = -100.0
+    text_logits[0, cfg.audio_start_token_id] = 3.0
+    text_logits[1, cfg.audio_assistant_gen_slot_token_id] = 2.0
+    text_logits[1, cfg.audio_assistant_delay_slot_token_id] = 2.1
+    audio_logits = [
+        torch.randn((2, 5), generator=generator),
+        torch.randn((2, 5), generator=generator),
+        torch.randn((2, 5), generator=generator),
+    ]
+    for logits in audio_logits:
+        logits[:, cfg.audio_pad_code] = -100.0
+    channel_logits = [text_logits, *audio_logits]
+
+    rows_ref = runner._sample_rows(
+        clone_channel_logits(channel_logits),
+        datas_ref,
+        n_vq=3,
+    )
+    rows_cg = runner._sample_rows_cuda_graph(
+        clone_channel_logits(channel_logits),
+        datas_cg,
+        n_vq=3,
+    )
+
+    assert torch.equal(rows_ref, rows_cg)
+    for data_ref, data_cg in zip(datas_ref, datas_cg, strict=True):
+        assert_moss_sample_data_equal(data_ref, data_cg)
+
+
+def test_moss_sample_rows_cuda_graph_matches_reference_audio_repetition_penalty() -> (
+    None
+):
+    runner, cfg = make_moss_sample_runner()
+    data_ref = make_moss_sample_data(
+        audio_length=1,
+        delayed_length=_INF_DELAY,
+        is_audio=True,
+        generation_steps=7,
+        audio_repetition_penalty=2.0,
+        prompt_rows=torch.tensor(
+            [
+                [cfg.audio_start_token_id, 2, 3],
+                [cfg.audio_assistant_gen_slot_token_id, 2, 1],
+            ],
+            dtype=torch.long,
+        ),
+        output_rows=[
+            torch.tensor(
+                [cfg.audio_assistant_gen_slot_token_id, 2, 0],
+                dtype=torch.long,
+            )
+        ],
+    )
+    data_cg = clone_moss_data(data_ref)
+
+    text_logits = torch.full((1, 20), -100.0)
+    text_logits[0, cfg.audio_assistant_gen_slot_token_id] = 10.0
+    text_logits[0, cfg.audio_assistant_delay_slot_token_id] = 0.0
+    audio0_logits = torch.tensor([[-1.0, 4.0, 6.0, 1.0, -100.0]])
+    audio1_logits = torch.tensor([[-1.0, 1.0, 0.0, 6.0, -100.0]])
+    channel_logits = [text_logits, audio0_logits, audio1_logits]
+
+    rows_ref = runner._sample_rows(
+        clone_channel_logits(channel_logits),
+        [data_ref],
+        n_vq=2,
+    )
+    rows_cg = runner._sample_rows_cuda_graph(
+        clone_channel_logits(channel_logits),
+        [data_cg],
+        n_vq=2,
+    )
+
+    assert torch.equal(rows_ref, rows_cg)
+    assert rows_ref[0].tolist() == [
+        cfg.audio_assistant_gen_slot_token_id,
+        1,
+        cfg.audio_pad_code,
+    ]
+    assert_moss_sample_data_equal(data_ref, data_cg)
 
 
 def test_moss_prefill_forward_uses_prompt_row_embeds() -> None:

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -14,6 +15,27 @@ from sglang_omni.scheduling.types import RequestOutput
 
 _NEG_INF = float("-inf")
 _INT64_MAX = torch.iinfo(torch.int64).max
+
+
+@dataclass
+class _MossTTSCudaGraphSampleRowsPre:
+    cfg: Any
+    datas: list
+    device: torch.device
+    n_real: int
+    graph_bs: int
+    valid_mask: torch.Tensor
+    delay_state: torch.Tensor
+    generation_steps: torch.Tensor
+    text_temperature: torch.Tensor
+    text_top_p: torch.Tensor
+    text_top_k: torch.Tensor
+    audio_temperature: torch.Tensor
+    audio_top_p: torch.Tensor
+    audio_top_k: torch.Tensor
+    sampling_seeds: torch.Tensor
+    text_logits: torch.Tensor
+    audio_logits: torch.Tensor
 
 
 class MossTTSModelRunner(ModelRunner):
@@ -385,6 +407,381 @@ class MossTTSModelRunner(ModelRunner):
         rows[:, 0] = next_text
         rows[:, 1:] = next_audio
         return rows
+
+    @staticmethod
+    def _moss_tts_cuda_graph_bs(batch_size: int) -> int:
+        for bucket in (1, 2, 4, 8, 16):
+            if batch_size <= bucket:
+                return bucket
+        return batch_size
+
+    def _sample_rows_cuda_graph(
+        self,
+        channel_logits: list[torch.Tensor],
+        datas: list,
+        *,
+        n_vq: int,
+    ) -> torch.Tensor:
+        """Graph-shaped MOSS-TTS delay-pattern sampling path.
+
+        This intentionally mirrors ``_sample_rows`` while keeping eager pre,
+        fixed-shape tensor body, and post state scatter isolated from the
+        production sampling path.
+        """
+        device = channel_logits[0].device
+        if not datas:
+            return torch.empty((0, n_vq + 1), dtype=torch.long, device=device)
+
+        prepared = self._sample_rows_cuda_graph_pre(
+            channel_logits,
+            datas,
+            n_vq=n_vq,
+        )
+        rows, next_state = self._sample_rows_cuda_graph_body(prepared, n_vq=n_vq)
+        return self._sample_rows_cuda_graph_post(prepared, rows, next_state)
+
+    def _sample_rows_cuda_graph_pre(
+        self,
+        channel_logits: list[torch.Tensor],
+        datas: list,
+        *,
+        n_vq: int,
+    ) -> _MossTTSCudaGraphSampleRowsPre:
+        cfg = self.model.config
+        device = channel_logits[0].device
+        n_real = len(datas)
+        graph_bs = self._moss_tts_cuda_graph_bs(n_real)
+        valid_mask = torch.zeros(graph_bs, dtype=torch.bool, device=device)
+        valid_mask[:n_real] = True
+
+        delay_state_real = torch.stack(
+            [self._delay_state_tensor(d, device) for d in datas],
+            dim=0,
+        )
+        delay_state = torch.empty((graph_bs, 3), dtype=torch.long, device=device)
+        delay_state[:, 0] = 0
+        delay_state[:, 1] = _INT64_MAX
+        delay_state[:, 2] = 0
+        delay_state[:n_real] = delay_state_real
+
+        def pad_1d(real: torch.Tensor, padding: float | int) -> torch.Tensor:
+            padded = torch.full(
+                (graph_bs,),
+                padding,
+                dtype=real.dtype,
+                device=device,
+            )
+            padded[:n_real] = real
+            return padded
+
+        generation_steps = pad_1d(
+            torch.tensor(
+                [int(d.generation_steps) for d in datas],
+                dtype=torch.long,
+                device=device,
+            ),
+            0,
+        )
+        text_temperature = pad_1d(
+            torch.tensor(
+                [float(d.text_temperature) for d in datas],
+                dtype=torch.float32,
+                device=device,
+            ),
+            0.0,
+        )
+        text_top_p = pad_1d(
+            torch.tensor(
+                [float(d.text_top_p) for d in datas],
+                dtype=torch.float32,
+                device=device,
+            ),
+            1.0,
+        )
+        text_top_k = pad_1d(
+            torch.tensor(
+                [int(d.text_top_k) for d in datas],
+                dtype=torch.long,
+                device=device,
+            ),
+            -1,
+        )
+        audio_temperature = pad_1d(
+            torch.tensor(
+                [float(d.audio_temperature) for d in datas],
+                dtype=torch.float32,
+                device=device,
+            ),
+            0.0,
+        )
+        audio_top_p = pad_1d(
+            torch.tensor(
+                [float(d.audio_top_p) for d in datas],
+                dtype=torch.float32,
+                device=device,
+            ),
+            1.0,
+        )
+        audio_top_k = pad_1d(
+            torch.tensor(
+                [int(d.audio_top_k) for d in datas],
+                dtype=torch.long,
+                device=device,
+            ),
+            -1,
+        )
+        audio_rep_real = torch.tensor(
+            [float(d.audio_repetition_penalty) for d in datas],
+            dtype=torch.float32,
+            device=device,
+        )
+        sampling_seeds = pad_1d(
+            torch.tensor(
+                [int(d.sampling_seed) for d in datas],
+                dtype=torch.long,
+                device=device,
+            ),
+            0,
+        )
+
+        padded_channel_logits = []
+        for logits in channel_logits:
+            padded = torch.zeros(
+                (graph_bs, int(logits.shape[-1])),
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+            padded[:n_real] = logits
+            padded_channel_logits.append(padded)
+
+        audio_logits = torch.stack(
+            [cl.to(torch.float32) for cl in padded_channel_logits[1:]],
+            dim=1,
+        )
+        if bool((audio_rep_real != 1.0).any()):
+            self._apply_audio_repetition_penalty(
+                audio_logits[:n_real],
+                datas,
+                n_vq=n_vq,
+            )
+
+        return _MossTTSCudaGraphSampleRowsPre(
+            cfg=cfg,
+            datas=datas,
+            device=device,
+            n_real=n_real,
+            graph_bs=graph_bs,
+            valid_mask=valid_mask,
+            delay_state=delay_state,
+            generation_steps=generation_steps,
+            text_temperature=text_temperature,
+            text_top_p=text_top_p,
+            text_top_k=text_top_k,
+            audio_temperature=audio_temperature,
+            audio_top_p=audio_top_p,
+            audio_top_k=audio_top_k,
+            sampling_seeds=sampling_seeds,
+            text_logits=padded_channel_logits[0].to(torch.float32).clone(),
+            audio_logits=audio_logits,
+        )
+
+    def _sample_rows_cuda_graph_body(
+        self,
+        prepared: _MossTTSCudaGraphSampleRowsPre,
+        *,
+        n_vq: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cfg = prepared.cfg
+        device = prepared.device
+        graph_bs = prepared.graph_bs
+        valid_mask = prepared.valid_mask
+        delay_state = prepared.delay_state
+        generation_steps = prepared.generation_steps
+        text_logits = prepared.text_logits
+        audio_logits = prepared.audio_logits
+
+        pad_token_id = int(cfg.pad_token_id)
+        gen_slot = int(cfg.audio_assistant_gen_slot_token_id)
+        delay_slot = int(cfg.audio_assistant_delay_slot_token_id)
+        audio_start = int(cfg.audio_start_token_id)
+        audio_end = int(cfg.audio_end_token_id)
+        im_end = int(cfg.im_end_token_id)
+        audio_pad_code = int(cfg.audio_pad_code)
+
+        num_channels = n_vq + 1
+        vocab = text_logits.shape[-1]
+        audio_lengths = delay_state[:, 0]
+        delayed = delay_state[:, 1]
+        is_audio = delay_state[:, 2].bool()
+
+        next_text = torch.full(
+            (graph_bs,),
+            pad_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        delay_slot_tensor = torch.full_like(next_text, delay_slot)
+        next_text = torch.where(delayed < n_vq, delay_slot_tensor, next_text)
+
+        is_audio_eos = delayed == n_vq
+        audio_end_tensor = torch.full_like(next_text, audio_end)
+        next_text = torch.where(is_audio_eos, audio_end_tensor, next_text)
+        is_audio = is_audio & ~is_audio_eos
+        sampling_text_mask = (delayed > n_vq) & valid_mask
+
+        token_ids = torch.arange(vocab, dtype=torch.long, device=device)
+        exclude_when_not_audio = (
+            (token_ids == pad_token_id)
+            | (token_ids == gen_slot)
+            | (token_ids == delay_slot)
+            | (token_ids == audio_end)
+        )
+        text_logits = text_logits.masked_fill(
+            (~is_audio)[:, None] & exclude_when_not_audio[None, :],
+            _NEG_INF,
+        )
+
+        disallow_when_audio = torch.ones(vocab, dtype=torch.bool, device=device)
+        if 0 <= gen_slot < vocab:
+            disallow_when_audio[gen_slot] = False
+        if 0 <= delay_slot < vocab:
+            disallow_when_audio[delay_slot] = False
+        text_logits = text_logits.masked_fill(
+            is_audio[:, None] & disallow_when_audio[None, :],
+            _NEG_INF,
+        )
+
+        if 0 <= delay_slot < vocab:
+            text_logits = text_logits.masked_fill(
+                (generation_steps == 0)[:, None] & (token_ids == delay_slot)[None, :],
+                _NEG_INF,
+            )
+        if 0 <= im_end < vocab:
+            text_logits = text_logits.masked_fill(
+                (generation_steps <= n_vq)[:, None] & (token_ids == im_end)[None, :],
+                _NEG_INF,
+            )
+
+        sampled_text_all = self._sample_tokens(
+            text_logits,
+            temperature=prepared.text_temperature,
+            top_p=prepared.text_top_p,
+            top_k=prepared.text_top_k,
+            seeds=prepared.sampling_seeds,
+            positions=generation_steps * num_channels,
+        )
+        next_text = torch.where(sampling_text_mask, sampled_text_all, next_text)
+
+        is_audio = is_audio | (next_text == audio_start)
+        is_audio = is_audio & (next_text != im_end)
+        is_audio = is_audio & valid_mask
+
+        if 0 <= audio_pad_code < audio_logits.shape[-1]:
+            audio_logits[..., audio_pad_code:] = _NEG_INF
+
+        channel_idx = torch.arange(n_vq, dtype=torch.long, device=device)
+        pre_audio = audio_lengths[:, None] > channel_idx[None, :]
+        post_audio = channel_idx[None, :] > (delayed[:, None] - 1)
+        post_audio = post_audio | (delayed == _INT64_MAX)[:, None]
+        sampling_audio_mask = pre_audio & post_audio & valid_mask[:, None]
+
+        audio_vocab = audio_logits.shape[-1]
+        audio_temp_full = prepared.audio_temperature[:, None].expand(graph_bs, n_vq)
+        audio_top_p_full = prepared.audio_top_p[:, None].expand(graph_bs, n_vq)
+        audio_top_k_full = prepared.audio_top_k[:, None].expand(graph_bs, n_vq)
+        seeds_full = prepared.sampling_seeds[:, None].expand(graph_bs, n_vq)
+        audio_channel_offsets = torch.arange(
+            1,
+            n_vq + 1,
+            dtype=torch.long,
+            device=device,
+        )
+        positions_full = (
+            generation_steps[:, None] * num_channels + audio_channel_offsets[None, :]
+        )
+
+        sampled_audio_all = self._sample_tokens(
+            audio_logits.reshape(graph_bs * n_vq, audio_vocab),
+            temperature=audio_temp_full.reshape(graph_bs * n_vq),
+            top_p=audio_top_p_full.reshape(graph_bs * n_vq),
+            top_k=audio_top_k_full.reshape(graph_bs * n_vq),
+            seeds=seeds_full.reshape(graph_bs * n_vq),
+            positions=positions_full.reshape(graph_bs * n_vq),
+        ).reshape(graph_bs, n_vq)
+
+        next_audio_default = torch.full(
+            (graph_bs, n_vq),
+            audio_pad_code,
+            dtype=torch.long,
+            device=device,
+        )
+        next_audio = torch.where(
+            sampling_audio_mask,
+            sampled_audio_all,
+            next_audio_default,
+        )
+
+        increment = (
+            (next_text == audio_start)
+            | (next_text == gen_slot)
+            | (next_text == delay_slot)
+        )
+        next_audio_lengths = audio_lengths + increment.to(torch.long)
+        next_audio_lengths = torch.where(
+            next_text == audio_end,
+            torch.zeros_like(next_audio_lengths),
+            next_audio_lengths,
+        )
+
+        delay_slot_started = (delayed == _INT64_MAX) & (next_text == delay_slot)
+        next_delayed = torch.where(
+            delay_slot_started,
+            torch.zeros_like(delayed),
+            delayed,
+        )
+        not_inf = next_delayed != _INT64_MAX
+        next_delayed = torch.where(not_inf, next_delayed + 1, next_delayed)
+        next_delayed = torch.where(
+            next_delayed > n_vq,
+            torch.full_like(next_delayed, _INT64_MAX),
+            next_delayed,
+        )
+
+        computed_next_state = torch.stack(
+            (next_audio_lengths, next_delayed, is_audio.to(torch.long)),
+            dim=1,
+        )
+        next_state = torch.where(
+            valid_mask[:, None],
+            computed_next_state,
+            delay_state,
+        )
+
+        rows = torch.empty((graph_bs, n_vq + 1), dtype=torch.long, device=device)
+        rows[:, 0] = next_text
+        rows[:, 1:] = next_audio
+
+        return rows, next_state
+
+    @staticmethod
+    def _sample_rows_cuda_graph_post(
+        prepared: _MossTTSCudaGraphSampleRowsPre,
+        rows: torch.Tensor,
+        next_state: torch.Tensor,
+    ) -> torch.Tensor:
+        rows_real = rows[: prepared.n_real]
+        next_state_real = next_state[: prepared.n_real]
+        for i, data in enumerate(prepared.datas):
+            data.delay_state = next_state_real[i].detach()
+            if prepared.device.type == "cpu":
+                data.audio_length = int(next_state_real[i, 0])
+                delayed_i = int(next_state_real[i, 1])
+                data.delayed_length = (
+                    _INF_DELAY if delayed_i == _INT64_MAX else delayed_i
+                )
+                data.is_audio = bool(int(next_state_real[i, 2]))
+
+        return rows_real
 
     @staticmethod
     def _as_row_tensor(
