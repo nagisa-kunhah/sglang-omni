@@ -13,6 +13,7 @@ Usage (inside sglang-omni-jiaxind container on novita-h100):
 
 Exit code: 0 = all checks passed, 1 = any divergence detected.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -73,9 +74,7 @@ def _build_frame_fn(device: torch.device):
             )
             codes.append(code)
             if channel + 1 < _N_VQ:
-                embed = torch.nn.functional.embedding(
-                    code, tables[channel][:_VOCAB]
-                )
+                embed = torch.nn.functional.embedding(code, tables[channel][:_VOCAB])
                 current = module.step(embed.to(torch.bfloat16), channel + 1)
         return torch.stack(codes, dim=-1)
 
@@ -120,10 +119,13 @@ def _run_parity_check(
 
     all_ok = True
     for frame_idx in range(n_frames):
-        hidden = torch.randn(batch, _HIDDEN, device=device, dtype=torch.bfloat16,
-                             generator=rng)
-        seeds = (torch.arange(batch, device=device, dtype=torch.long) * 1_234_567
-                 + frame_idx * 13)
+        hidden = torch.randn(
+            batch, _HIDDEN, device=device, dtype=torch.bfloat16, generator=rng
+        )
+        seeds = (
+            torch.arange(batch, device=device, dtype=torch.long) * 1_234_567
+            + frame_idx * 13
+        )
         base = torch.full((batch,), frame_idx * 13, device=device, dtype=torch.long)
 
         s_hidden.copy_(hidden)
@@ -151,16 +153,23 @@ def _run_parity_check(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--batch-sizes", type=int, nargs="+", default=[1, 4, 16],
+        "--batch-sizes",
+        type=int,
+        nargs="+",
+        default=[1, 4, 16],
         metavar="BS",
         help="batch sizes to test (default: 1 4 16)",
     )
     parser.add_argument(
-        "--frames", type=int, default=30,
+        "--frames",
+        type=int,
+        default=30,
         help="number of frames to replay per batch size (default: 30)",
     )
     parser.add_argument(
-        "--seed", type=int, default=42,
+        "--seed",
+        type=int,
+        default=42,
         help="RNG seed for random inputs (default: 42)",
     )
     args = parser.parse_args(argv)

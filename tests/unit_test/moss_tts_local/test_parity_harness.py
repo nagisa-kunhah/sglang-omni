@@ -6,10 +6,11 @@ The GPU test (skipped without CUDA) verifies the frame-decode graph is
 deterministic and serves as the S0 gate baseline; it must not be modified
 after initial commit.
 """
+
 from __future__ import annotations
 
-import torch
 import pytest
+import torch
 
 from sglang_omni.models.moss_tts_local.request_builders import (
     MossTTSLocalSGLangRequestData,
@@ -18,7 +19,6 @@ from sglang_omni.models.moss_tts_local.request_builders import (
 from sglang_omni.proto import OmniRequest, StagePayload
 
 _N_VQ = 12
-_AUDIO_END_ID = 151670  # audio_end_token_id default (payload_types.py)
 
 
 def _payload(request_id: str = "r0") -> StagePayload:
@@ -42,10 +42,12 @@ def _data_with_rows(n_frames: int, seed: int) -> MossTTSLocalSGLangRequestData:
         engine_start_s=0.0,
     )
     for _ in range(n_frames):
-        row = torch.cat([
-            torch.tensor([1000]),  # non-stop slot
-            torch.randint(0, 1024, (_N_VQ,)),
-        ])
+        row = torch.cat(
+            [
+                torch.tensor([1000]),  # non-stop slot
+                torch.randint(0, 1024, (_N_VQ,)),
+            ]
+        )
         data.output_rows.append(row)
     return data
 
@@ -123,8 +125,7 @@ def test_s0_graph_replay_is_deterministic():
         rope_base=1_000_000.0,
     ).to(device=device, dtype=torch.bfloat16)
     tables = [
-        torch.randn(64, 64, device=device, dtype=torch.bfloat16)
-        for _ in range(_N_VQ)
+        torch.randn(64, 64, device=device, dtype=torch.bfloat16) for _ in range(_N_VQ)
     ]
 
     def decode_frame(
