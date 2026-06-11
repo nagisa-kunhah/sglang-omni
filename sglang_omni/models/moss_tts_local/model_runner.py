@@ -22,8 +22,8 @@ class MossTTSLocalModelRunner(ModelRunner):
     state per request; :meth:`_collect_frame` then runs the batched local
     micro-decode — a binary continue/stop decision and 12 sequentially
     sampled RVQ codes — and stages the next frame's summed embedding through
-    ``model._decode_input_embedding`` so the next decode step stays
-    CUDA-graph-replayable (decode input_ids are row indices).
+    the row-indexed decode-state pool. The legacy path still mirrors that
+    feedback into ``model._decode_input_embedding`` for decode replay.
     """
 
     def __init__(self, tp_worker: Any, output_processor: Any):
@@ -51,9 +51,10 @@ class MossTTSLocalModelRunner(ModelRunner):
     ) -> None:
         del is_lookahead
         del schedule_batch
-        self._write_decode_input_embedding(forward_batch, requests)
         if self._forward_sample_enabled():
             self._prepare_forward_sample_inputs(forward_batch, requests)
+        else:
+            self._write_decode_input_embedding(forward_batch, requests)
 
     def post_prefill(
         self,
@@ -187,19 +188,26 @@ class MossTTSLocalModelRunner(ModelRunner):
         return buckets[idx] if idx < len(buckets) else raw_batch_size
 
     def _forward_sample_enabled(self) -> bool:
-        return bool(getattr(self.model, "forward_sample_in_forward", False)) and all(
-            hasattr(self.model, name)
+        if not (
+            bool(getattr(self.model, "forward_sample_in_forward", False))
+            and hasattr(self.model, "_cg_pool_rows")
+            and hasattr(self.model, "_state_pool")
+        ):
+            return False
+        pool = self.model._state_pool
+        return all(
+            hasattr(pool, name)
             for name in (
-                "_cg_text_temp",
-                "_cg_text_top_p",
-                "_cg_text_top_k",
-                "_cg_audio_temp",
-                "_cg_audio_top_p",
-                "_cg_audio_top_k",
-                "_cg_seeds",
-                "_cg_base_positions",
-                "_cg_rows",
-                "_cg_feedback",
+                "text_temp",
+                "text_top_p",
+                "text_top_k",
+                "audio_temp",
+                "audio_top_p",
+                "audio_top_k",
+                "seeds",
+                "base_positions",
+                "rows",
+                "sample_feedback_embeds",
             )
         )
 
@@ -216,11 +224,16 @@ class MossTTSLocalModelRunner(ModelRunner):
         raw_batch_size = int(getattr(forward_batch, "batch_size", n_real) or n_real)
         staging_batch_size = self._decode_staging_batch_size(raw_batch_size)
         model = self.model
-        max_rows = int(model._cg_text_temp.shape[0])
+        max_rows = int(model._cg_pool_rows.shape[0])
         if raw_batch_size < n_real:
             raise RuntimeError(
                 "MOSS-TTS Local forward-sample graph batch is smaller than the "
                 f"real batch ({raw_batch_size} < {n_real})"
+            )
+        if forward_batch.input_ids.numel() < raw_batch_size:
+            raise RuntimeError(
+                "MOSS-TTS Local forward-sample decode input_ids must contain "
+                "one row id per request"
             )
         if staging_batch_size > max_rows:
             raise RuntimeError(
@@ -236,49 +249,35 @@ class MossTTSLocalModelRunner(ModelRunner):
             pool.ensure_params(row, rid, sched_req.data)
             pool_rows.append(row)
 
-        row_t = torch.tensor(
-            pool_rows, dtype=torch.long, device=pool.feedback_embeds.device
-        )
         num_channels = int(model.config.n_vq) + 1
         generation_steps = torch.tensor(
             [int(sched_req.data.generation_steps) for sched_req in requests],
             dtype=torch.long,
-            device=model._cg_base_positions.device,
+            device=pool.base_positions.device,
+        )
+        staged_pool_rows = list(pool_rows)
+        if staging_batch_size > n_real:
+            staged_pool_rows.extend([pool.padding_row] * (staging_batch_size - n_real))
+        row_t = torch.tensor(
+            staged_pool_rows, dtype=torch.long, device=pool.feedback_embeds.device
         )
 
         with torch.no_grad():
             if n_real:
-                model._cg_text_temp[:n_real].copy_(
-                    pool.text_temp[row_t].to(model._cg_text_temp.device)
+                real_row_t = row_t[:n_real].to(device=pool.base_positions.device)
+                pool.base_positions.index_copy_(
+                    0, real_row_t, generation_steps * num_channels
                 )
-                model._cg_text_top_p[:n_real].copy_(
-                    pool.text_top_p[row_t].to(model._cg_text_top_p.device)
-                )
-                model._cg_text_top_k[:n_real].copy_(
-                    pool.text_top_k[row_t].to(model._cg_text_top_k.device)
-                )
-                model._cg_audio_temp[:n_real].copy_(
-                    pool.audio_temp[row_t].to(model._cg_audio_temp.device)
-                )
-                model._cg_audio_top_p[:n_real].copy_(
-                    pool.audio_top_p[row_t].to(model._cg_audio_top_p.device)
-                )
-                model._cg_audio_top_k[:n_real].copy_(
-                    pool.audio_top_k[row_t].to(model._cg_audio_top_k.device)
-                )
-                model._cg_seeds[:n_real].copy_(
-                    pool.seeds[row_t].to(model._cg_seeds.device)
-                )
-                model._cg_base_positions[:n_real].copy_(generation_steps * num_channels)
-            if staging_batch_size > n_real:
-                model._cg_text_temp[n_real:staging_batch_size].fill_(1.0)
-                model._cg_text_top_p[n_real:staging_batch_size].fill_(1.0)
-                model._cg_text_top_k[n_real:staging_batch_size].fill_(50)
-                model._cg_audio_temp[n_real:staging_batch_size].fill_(1.0)
-                model._cg_audio_top_p[n_real:staging_batch_size].fill_(1.0)
-                model._cg_audio_top_k[n_real:staging_batch_size].fill_(25)
-                model._cg_seeds[n_real:staging_batch_size].zero_()
-                model._cg_base_positions[n_real:staging_batch_size].zero_()
+            model._cg_pool_rows[:staging_batch_size].copy_(
+                row_t.to(device=model._cg_pool_rows.device)
+            )
+
+        row_ids = torch.arange(
+            raw_batch_size,
+            dtype=torch.long,
+            device=forward_batch.input_ids.device,
+        )
+        forward_batch.input_ids[:raw_batch_size].copy_(row_ids)
 
         self._forward_sample_pool_rows = pool_rows
         self._forward_sample_rids = [sched_req.request_id for sched_req in requests]
@@ -345,15 +344,13 @@ class MossTTSLocalModelRunner(ModelRunner):
             )
 
         model = self.model
-        if (
-            int(model._cg_rows.shape[0]) < n_real
-            or int(model._cg_feedback.shape[0]) < n_real
-        ):
-            raise RuntimeError("MOSS-TTS Local forward-sample output buffers too small")
         cfg = model.config
         pool = model._state_pool
-        rows = model._cg_rows[:n_real].clone()
-        feedback = model._cg_feedback[:n_real].clone()
+        pool_row_t = torch.tensor(
+            pool_rows[:n_real], dtype=torch.long, device=pool.device
+        )
+        rows = pool.rows.index_select(0, pool_row_t).clone()
+        feedback = pool.sample_feedback_embeds.index_select(0, pool_row_t).clone()
         next_text = rows[:, 0]
         end_id = int(cfg.audio_end_token_id)
         next_token_ids = self._row_radix_token_ids(rows, next_text, end_id)

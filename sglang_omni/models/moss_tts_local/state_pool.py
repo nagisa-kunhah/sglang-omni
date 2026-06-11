@@ -34,6 +34,7 @@ class MossTTSLocalDecodeStatePool:
         self.num_rows = int(weight.shape[0]) + 1
         self.padding_row = self.num_rows - 1
         self.hidden_size = int(weight.shape[1])
+        self.n_vq = int(getattr(getattr(model, "config", None), "n_vq", 12))
         self.device = weight.device
         self.dtype = weight.dtype
 
@@ -65,12 +66,37 @@ class MossTTSLocalDecodeStatePool:
             self.num_rows, device=self.device, dtype=torch.int64
         )
         self.seeds = torch.zeros(self.num_rows, device=self.device, dtype=torch.int64)
+        self.base_positions = torch.zeros(
+            self.num_rows, device=self.device, dtype=torch.int64
+        )
+        self.stop_choice = torch.zeros(
+            self.num_rows, device=self.device, dtype=torch.int64
+        )
+        self.codes = torch.zeros(
+            self.num_rows,
+            self.n_vq,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        self.rows = torch.zeros(
+            self.num_rows,
+            self.n_vq + 1,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        self.sample_feedback_embeds = torch.zeros(
+            self.num_rows,
+            self.hidden_size,
+            device=self.device,
+            dtype=self.dtype,
+        )
 
         self._rid_to_row: dict[str, int] = {}
         self._params_written_rids: set[str] = set()
         # Real rows 0..P-2 are assignable; the padding row stays out of the
         # free list so it is never handed to a request.
         self._free_rows: list[int] = list(range(self.padding_row))
+        self._set_padding_defaults()
 
     def acquire_row(self, rid: str) -> int:
         """Assign (or return the existing) row for ``rid``.
@@ -101,8 +127,16 @@ class MossTTSLocalDecodeStatePool:
         self._free_rows.append(row_idx)
 
     def reset_row(self, row_idx: int) -> None:
-        """Zero every field of ``row_idx`` (clears stranded feedback/params)."""
+        """Reset ``row_idx`` while preserving safe defaults for padding."""
         self.feedback_embeds[row_idx].zero_()
+        self.base_positions[row_idx] = 0
+        self.stop_choice[row_idx] = 0
+        self.codes[row_idx].zero_()
+        self.rows[row_idx].zero_()
+        self.sample_feedback_embeds[row_idx].zero_()
+        if row_idx == self.padding_row:
+            self._set_padding_defaults()
+            return
         self.text_temp[row_idx] = 0.0
         self.text_top_p[row_idx] = 0.0
         self.audio_temp[row_idx] = 0.0
@@ -110,6 +144,18 @@ class MossTTSLocalDecodeStatePool:
         self.text_top_k[row_idx] = 0
         self.audio_top_k[row_idx] = 0
         self.seeds[row_idx] = 0
+
+    def _set_padding_defaults(self) -> None:
+        """Sampling defaults used when CUDA graph buckets include padding."""
+        row_idx = self.padding_row
+        self.text_temp[row_idx] = 1.0
+        self.text_top_p[row_idx] = 1.0
+        self.text_top_k[row_idx] = 50
+        self.audio_temp[row_idx] = 1.0
+        self.audio_top_p[row_idx] = 1.0
+        self.audio_top_k[row_idx] = 25
+        self.seeds[row_idx] = 0
+        self.base_positions[row_idx] = 0
 
     def write_params(self, row_idx: int, data: Any) -> None:
         """Write the seven request-static sampling fields into ``row_idx``.

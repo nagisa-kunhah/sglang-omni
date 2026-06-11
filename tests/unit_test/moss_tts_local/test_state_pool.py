@@ -58,6 +58,35 @@ def test_pool_dims_derive_from_embedding_weight():
     for name in ("text_top_k", "audio_top_k", "seeds"):
         assert getattr(pool, name).shape == (5,)
         assert getattr(pool, name).dtype == torch.int64
+    assert pool.base_positions.shape == (5,)
+    assert pool.base_positions.dtype == torch.int64
+    assert pool.stop_choice.shape == (5,)
+    assert pool.stop_choice.dtype == torch.int64
+    assert pool.codes.shape == (5, 12)
+    assert pool.codes.dtype == torch.int64
+    assert pool.rows.shape == (5, 13)
+    assert pool.rows.dtype == torch.int64
+    assert pool.sample_feedback_embeds.shape == (5, _HIDDEN)
+    assert pool.sample_feedback_embeds.dtype == torch.bfloat16
+
+
+def test_padding_row_has_safe_sampling_defaults():
+    pool = MossTTSLocalDecodeStatePool(_model(max_running_requests=4))
+    row = pool.padding_row
+    assert pool.text_temp[row].item() == 1.0
+    assert pool.text_top_p[row].item() == 1.0
+    assert int(pool.text_top_k[row]) == 50
+    assert pool.audio_temp[row].item() == 1.0
+    assert pool.audio_top_p[row].item() == 1.0
+    assert int(pool.audio_top_k[row]) == 25
+    assert int(pool.seeds[row]) == 0
+    assert int(pool.base_positions[row]) == 0
+
+    pool.text_temp[row] = 0.0
+    pool.text_top_k[row] = 0
+    pool.reset_row(row)
+    assert pool.text_temp[row].item() == 1.0
+    assert int(pool.text_top_k[row]) == 50
 
 
 def test_acquire_is_idempotent_by_rid():
@@ -114,11 +143,21 @@ def test_release_resets_row_fields():
     row = pool.acquire_row("a")
     pool.write_params(row, _params(seed=123))
     pool.feedback_embeds[row].fill_(1.0)
+    pool.base_positions[row] = 13
+    pool.stop_choice[row] = 1
+    pool.codes[row].fill_(3)
+    pool.rows[row].fill_(4)
+    pool.sample_feedback_embeds[row].fill_(5.0)
     pool.release_row("a")
     assert torch.all(pool.feedback_embeds[row] == 0)
     assert pool.text_temp[row] == 0.0
     assert pool.audio_top_k[row] == 0
     assert pool.seeds[row] == 0
+    assert pool.base_positions[row] == 0
+    assert pool.stop_choice[row] == 0
+    assert torch.all(pool.codes[row] == 0)
+    assert torch.all(pool.rows[row] == 0)
+    assert torch.all(pool.sample_feedback_embeds[row] == 0)
 
 
 def test_reset_row_zeroes_all_fields():
@@ -126,6 +165,11 @@ def test_reset_row_zeroes_all_fields():
     row = pool.acquire_row("a")
     pool.write_params(row, _params(seed=99))
     pool.feedback_embeds[row].fill_(2.0)
+    pool.base_positions[row] = 13
+    pool.stop_choice[row] = 1
+    pool.codes[row].fill_(3)
+    pool.rows[row].fill_(4)
+    pool.sample_feedback_embeds[row].fill_(5.0)
     pool.reset_row(row)
     assert torch.all(pool.feedback_embeds[row] == 0)
     for name in (
@@ -138,6 +182,11 @@ def test_reset_row_zeroes_all_fields():
         "seeds",
     ):
         assert getattr(pool, name)[row] == 0
+    assert pool.base_positions[row] == 0
+    assert pool.stop_choice[row] == 0
+    assert torch.all(pool.codes[row] == 0)
+    assert torch.all(pool.rows[row] == 0)
+    assert torch.all(pool.sample_feedback_embeds[row] == 0)
 
 
 def test_write_params_writes_request_static_fields():
@@ -254,18 +303,10 @@ def _forward_sample_model(max_running_requests: int = 4) -> SimpleNamespace:
     model._moss_local_decode_cuda_graph_bs = [1, 2, 4, 8, 16]
     model._moss_local_decode_graph_padding = False
     model._state_pool = MossTTSLocalDecodeStatePool(model)
-    hidden = model._decode_input_embedding.weight.shape[1]
-    model._cg_text_temp = torch.ones(max_running_requests, dtype=torch.float32)
-    model._cg_text_top_p = torch.ones(max_running_requests, dtype=torch.float32)
-    model._cg_text_top_k = torch.full((max_running_requests,), 50, dtype=torch.int64)
-    model._cg_audio_temp = torch.ones(max_running_requests, dtype=torch.float32)
-    model._cg_audio_top_p = torch.ones(max_running_requests, dtype=torch.float32)
-    model._cg_audio_top_k = torch.full((max_running_requests,), 25, dtype=torch.int64)
-    model._cg_seeds = torch.zeros(max_running_requests, dtype=torch.int64)
-    model._cg_base_positions = torch.zeros(max_running_requests, dtype=torch.int64)
-    model._cg_rows = torch.zeros(max_running_requests, 13, dtype=torch.int64)
-    model._cg_feedback = torch.zeros(
-        max_running_requests, hidden, dtype=model._decode_input_embedding.weight.dtype
+    model._cg_pool_rows = torch.full(
+        (max_running_requests,),
+        model._state_pool.padding_row,
+        dtype=torch.int64,
     )
     return model
 
@@ -317,32 +358,33 @@ def test_before_decode_stages_forward_sample_buffers_and_padding():
         batch_size=4,
         input_ids=torch.full((4,), -1, dtype=torch.long),
     )
+    original_weight = model._decode_input_embedding.weight.clone()
 
     runner.before_decode(forward_batch, SimpleNamespace(), requests)
 
-    expected_feedback = torch.stack(
-        [
-            pool.feedback_embeds[row_a],
-            pool.feedback_embeds[row_b],
-            pool.feedback_embeds[pool.padding_row],
-            pool.feedback_embeds[pool.padding_row],
-        ],
-        dim=0,
-    )
-    assert torch.equal(model._decode_input_embedding.weight[:4], expected_feedback)
+    assert torch.equal(model._decode_input_embedding.weight, original_weight)
     assert torch.equal(forward_batch.input_ids, torch.tensor([0, 1, 2, 3]))
-    torch.testing.assert_close(
-        model._cg_text_temp[:2], torch.tensor([0.53, 0.55], dtype=torch.float32)
+    assert torch.equal(
+        model._cg_pool_rows[:4],
+        torch.tensor([row_a, row_b, pool.padding_row, pool.padding_row]),
     )
-    assert torch.equal(model._cg_audio_top_k[:2], torch.tensor([25, 17]))
-    assert torch.equal(model._cg_seeds[:2], torch.tensor([3, 5]))
-    assert torch.equal(model._cg_base_positions[:2], torch.tensor([26, 52]))
-    torch.testing.assert_close(model._cg_text_temp[2:4], torch.ones(2))
-    torch.testing.assert_close(model._cg_audio_top_p[2:4], torch.ones(2))
-    assert torch.equal(model._cg_text_top_k[2:4], torch.tensor([50, 50]))
-    assert torch.equal(model._cg_audio_top_k[2:4], torch.tensor([25, 25]))
-    assert torch.equal(model._cg_seeds[2:4], torch.tensor([0, 0]))
-    assert torch.equal(model._cg_base_positions[2:4], torch.tensor([0, 0]))
+    torch.testing.assert_close(
+        pool.text_temp[torch.tensor([row_a, row_b])],
+        torch.tensor([0.53, 0.55], dtype=torch.float32),
+    )
+    assert torch.equal(
+        pool.audio_top_k[torch.tensor([row_a, row_b])], torch.tensor([25, 17])
+    )
+    assert torch.equal(pool.seeds[torch.tensor([row_a, row_b])], torch.tensor([3, 5]))
+    assert torch.equal(
+        pool.base_positions[torch.tensor([row_a, row_b])], torch.tensor([26, 52])
+    )
+    assert pool.text_temp[pool.padding_row].item() == 1.0
+    assert pool.audio_top_p[pool.padding_row].item() == 1.0
+    assert int(pool.text_top_k[pool.padding_row]) == 50
+    assert int(pool.audio_top_k[pool.padding_row]) == 25
+    assert int(pool.seeds[pool.padding_row]) == 0
+    assert int(pool.base_positions[pool.padding_row]) == 0
     assert runner._forward_sample_pool_rows == [row_a, row_b]
     assert runner._forward_sample_rids == ["a", "b"]
 
@@ -367,25 +409,21 @@ def test_before_decode_stages_to_cuda_graph_bucket_when_padding_enabled():
         batch_size=3,
         input_ids=torch.full((3,), -1, dtype=torch.long),
     )
+    original_weight = model._decode_input_embedding.weight.clone()
 
     runner.before_decode(forward_batch, SimpleNamespace(), [request])
 
-    expected_feedback = torch.stack(
-        [
-            pool.feedback_embeds[row],
-            pool.feedback_embeds[pool.padding_row],
-            pool.feedback_embeds[pool.padding_row],
-            pool.feedback_embeds[pool.padding_row],
-        ],
-        dim=0,
-    )
-    assert torch.equal(model._decode_input_embedding.weight[:4], expected_feedback)
+    assert torch.equal(model._decode_input_embedding.weight, original_weight)
     assert torch.equal(forward_batch.input_ids, torch.tensor([0, 1, 2]))
-    torch.testing.assert_close(model._cg_text_temp[1:4], torch.ones(3))
-    assert torch.equal(model._cg_text_top_k[1:4], torch.tensor([50, 50, 50]))
-    assert torch.equal(model._cg_audio_top_k[1:4], torch.tensor([25, 25, 25]))
-    assert torch.equal(model._cg_seeds[1:4], torch.tensor([0, 0, 0]))
-    assert torch.equal(model._cg_base_positions[1:4], torch.tensor([0, 0, 0]))
+    assert torch.equal(
+        model._cg_pool_rows[:4],
+        torch.tensor([row, pool.padding_row, pool.padding_row, pool.padding_row]),
+    )
+    assert pool.text_temp[pool.padding_row].item() == 1.0
+    assert int(pool.text_top_k[pool.padding_row]) == 50
+    assert int(pool.audio_top_k[pool.padding_row]) == 25
+    assert int(pool.seeds[pool.padding_row]) == 0
+    assert int(pool.base_positions[pool.padding_row]) == 0
 
 
 def test_fresh_row_zeros_feedback():
@@ -656,8 +694,12 @@ def test_forward_sample_collect_matches_legacy_graph_collect():
         input_ids=torch.full((2,), -1, dtype=torch.long),
     )
     new_runner.before_decode(forward_batch, SimpleNamespace(), new_requests)
-    new_model._cg_rows[:2] = rows
-    new_model._cg_feedback[:2] = feedback
+    new_pool = new_model._state_pool
+    new_pool_row_t = torch.tensor(
+        new_runner._forward_sample_pool_rows, dtype=torch.long, device=new_pool.device
+    )
+    new_pool.rows[new_pool_row_t] = rows
+    new_pool.sample_feedback_embeds[new_pool_row_t] = feedback
     new_result = SimpleNamespace(logits_output=SimpleNamespace())
     new_batch = SimpleNamespace()
 

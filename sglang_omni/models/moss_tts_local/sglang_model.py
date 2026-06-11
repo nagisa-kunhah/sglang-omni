@@ -138,50 +138,16 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         self._state_pool = MossTTSLocalDecodeStatePool(self)
 
     def init_forward_sample_buffers(self) -> None:
-        """Allocate fixed decode-time staging used by the opt-in forward path."""
+        """Allocate fixed decode-time row-id staging for the opt-in path."""
         weight = self._decode_input_embedding.weight
         max_running_requests = int(weight.shape[0])
         device = weight.device
-        self._cg_text_temp = torch.ones(
-            max_running_requests, device=device, dtype=torch.float32
-        )
-        self._cg_text_top_p = torch.ones(
-            max_running_requests, device=device, dtype=torch.float32
-        )
-        self._cg_text_top_k = torch.full(
-            (max_running_requests,), 50, device=device, dtype=torch.int64
-        )
-        self._cg_audio_temp = torch.ones(
-            max_running_requests, device=device, dtype=torch.float32
-        )
-        self._cg_audio_top_p = torch.ones(
-            max_running_requests, device=device, dtype=torch.float32
-        )
-        self._cg_audio_top_k = torch.full(
-            (max_running_requests,), 25, device=device, dtype=torch.int64
-        )
-        self._cg_seeds = torch.zeros(
-            max_running_requests, device=device, dtype=torch.int64
-        )
-        self._cg_base_positions = torch.zeros(
-            max_running_requests, device=device, dtype=torch.int64
-        )
-
-        self._cg_stop_choice = torch.zeros(
-            max_running_requests, device=device, dtype=torch.int64
-        )
-        self._cg_codes = torch.zeros(
-            max_running_requests, self.n_vq, device=device, dtype=torch.int64
-        )
-        self._cg_feedback = torch.zeros(
+        # The pool has max_running_requests + 1 rows; the last row is reserved
+        # for CUDA graph padding. The pool may not be constructed yet, but its
+        # padding row is therefore exactly max_running_requests.
+        self._cg_pool_rows = torch.full(
+            (max_running_requests,),
             max_running_requests,
-            self.hidden_size,
-            device=device,
-            dtype=weight.dtype,
-        )
-        self._cg_rows = torch.zeros(
-            max_running_requests,
-            self.n_vq + 1,
             device=device,
             dtype=torch.int64,
         )
@@ -346,7 +312,18 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         )
         if input_embeds is None:
             if is_decode:
-                input_embeds = self._decode_input_embedding(input_ids)
+                if (
+                    bool(getattr(self, "forward_sample_in_forward", False))
+                    and hasattr(self, "_cg_pool_rows")
+                    and hasattr(self, "_state_pool")
+                ):
+                    batch_size = int(input_ids.shape[0])
+                    row_ids = self._cg_pool_rows[:batch_size]
+                    input_embeds = F.embedding(
+                        row_ids, self._state_pool.feedback_embeds
+                    )
+                else:
+                    input_embeds = self._decode_input_embedding(input_ids)
             elif self.pp_group.is_first_rank:
                 input_embeds = self._prepare_multi_modal_inputs(input_ids)
             else:
@@ -369,23 +346,26 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         if (
             is_decode
             and bool(getattr(self, "forward_sample_in_forward", False))
-            and hasattr(self, "_cg_text_temp")
+            and hasattr(self, "_cg_pool_rows")
+            and hasattr(self, "_state_pool")
         ):
             batch_size = int(sample_hidden_states.shape[0])
+            pool = self._state_pool
+            row_ids = self._cg_pool_rows[:batch_size]
             stop_choice, codes, feedback = self._decode_frame_graphable(
                 sample_hidden_states,
-                text_temperature=self._cg_text_temp[:batch_size],
-                text_top_p=self._cg_text_top_p[:batch_size],
-                text_top_k=self._cg_text_top_k[:batch_size],
-                audio_temperature=self._cg_audio_temp[:batch_size],
-                audio_top_p=self._cg_audio_top_p[:batch_size],
-                audio_top_k=self._cg_audio_top_k[:batch_size],
-                seeds=self._cg_seeds[:batch_size],
-                base_positions=self._cg_base_positions[:batch_size],
+                text_temperature=pool.text_temp[row_ids],
+                text_top_p=pool.text_top_p[row_ids],
+                text_top_k=pool.text_top_k[row_ids],
+                audio_temperature=pool.audio_temp[row_ids],
+                audio_top_p=pool.audio_top_p[row_ids],
+                audio_top_k=pool.audio_top_k[row_ids],
+                seeds=pool.seeds[row_ids],
+                base_positions=pool.base_positions[row_ids],
             )
-            self._cg_stop_choice[:batch_size] = stop_choice
-            self._cg_codes[:batch_size] = codes
-            self._cg_feedback[:batch_size] = feedback
+            pool.stop_choice[row_ids] = stop_choice
+            pool.codes[row_ids] = codes
+            pool.sample_feedback_embeds[row_ids] = feedback
             slot_id = int(self.config.audio_assistant_slot_token_id)
             end_id = int(self.config.audio_end_token_id)
             next_text = torch.where(
@@ -393,8 +373,8 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                 torch.full_like(stop_choice, slot_id),
                 torch.full_like(stop_choice, end_id),
             )
-            self._cg_rows[:batch_size, 0] = next_text
-            self._cg_rows[:batch_size, 1:] = codes
+            pool.rows[row_ids, 0] = next_text
+            pool.rows[row_ids, 1:] = codes
 
         # Legacy flow consumes hidden_states in the model runner and samples
         # there. The opt-in forward-sample flow above has already written the
