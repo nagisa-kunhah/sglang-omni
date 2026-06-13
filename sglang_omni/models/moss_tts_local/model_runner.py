@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import bisect
 from typing import Any
 
 import torch
@@ -19,11 +20,9 @@ class MossTTSLocalModelRunner(ModelRunner):
     """Drives the per-frame local-transformer decode and feedback embeddings.
 
     Per step: the backbone (radix-cached, CUDA-graphed) produces one hidden
-    state per request; :meth:`_collect_frame` then runs the batched local
-    micro-decode — a binary continue/stop decision and 12 sequentially
-    sampled RVQ codes — and stages the next frame's summed embedding through
-    ``model._decode_input_embedding`` so the next decode step stays
-    CUDA-graph-replayable (decode input_ids are row indices).
+    state per request. Prefill collection runs the local micro-decode in the
+    runner; decode collection reads the frame sampled inside model forward and
+    staged in the row-indexed decode-state pool.
     """
 
     _outbox: Any | None = None
@@ -59,7 +58,7 @@ class MossTTSLocalModelRunner(ModelRunner):
     ) -> None:
         del is_lookahead
         del schedule_batch
-        self._write_decode_input_embedding(forward_batch, requests)
+        self._prepare_forward_sample_inputs(forward_batch, requests)
 
     def post_prefill(
         self,
@@ -74,7 +73,7 @@ class MossTTSLocalModelRunner(ModelRunner):
             is_prefill_only = False
         if bool(is_prefill_only):
             return
-        self._collect_frame(result, forward_batch, schedule_batch, requests)
+        self._collect_frame_legacy(result, forward_batch, schedule_batch, requests)
 
     def post_decode(
         self,
@@ -83,7 +82,10 @@ class MossTTSLocalModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        self._collect_frame(result, forward_batch, schedule_batch, requests)
+        if bool(getattr(forward_batch, "moss_has_audio_repetition_penalty", False)):
+            self._collect_frame_legacy(result, forward_batch, schedule_batch, requests)
+            return
+        self._collect_frame_from_forward_sample(result, schedule_batch, requests)
 
     def lookahead_eligible(self, batch: Any) -> bool:
         """Route to sync when the batch cannot take the graphed frame-decode
@@ -177,37 +179,236 @@ class MossTTSLocalModelRunner(ModelRunner):
         forward_batch: Any,
         requests: list,
     ) -> None:
-        batch_size = len(requests)
-        if batch_size == 0:
+        self._prepare_forward_sample_inputs(forward_batch, requests)
+
+    def _decode_staging_batch_size(self, raw_batch_size: int) -> int:
+        """Return the model-buffer rows SGLang may read for this decode step.
+
+        SGLang's cuda graph runner receives the raw ForwardBatch, then pads it
+        to the next captured ``cuda_graph_bs`` bucket during replay. The model
+        staging buffers are outside SGLang's GraphInputBuffers, so they must be
+        prefilled up to the same bucket here.
+        """
+        raw_batch_size = int(raw_batch_size)
+        if raw_batch_size <= 0:
+            return 0
+        if not bool(getattr(self.model, "_moss_local_decode_graph_padding", False)):
+            return raw_batch_size
+        buckets = sorted(
+            {
+                int(bs)
+                for bs in getattr(self.model, "_moss_local_decode_cuda_graph_bs", [])
+                if int(bs) > 0
+            }
+        )
+        if not buckets:
+            return raw_batch_size
+        idx = bisect.bisect_left(buckets, raw_batch_size)
+        return buckets[idx] if idx < len(buckets) else raw_batch_size
+
+    def _prepare_forward_sample_inputs(
+        self,
+        forward_batch: Any,
+        requests: list,
+    ) -> None:
+        if not requests:
+            self._forward_sample_pool_rows = []
+            self._forward_sample_pool_row_t = None
+            self._forward_sample_rids = []
+            self._forward_sample_native_decode = True
             return
-        pool = self.model._state_pool
-        weight = self.model._decode_input_embedding.weight
-        if forward_batch.input_ids.numel() < batch_size:
+        n_real = len(requests)
+        raw_batch_size = int(getattr(forward_batch, "batch_size", n_real) or n_real)
+        staging_batch_size = self._decode_staging_batch_size(raw_batch_size)
+        model = self.model
+        max_rows = int(model._cg_pool_rows.shape[0])
+        if raw_batch_size < n_real:
             raise RuntimeError(
-                "MOSS-TTS Local decode input_ids must contain one row id per request"
+                "MOSS-TTS Local decode graph batch is smaller than the "
+                f"real batch ({raw_batch_size} < {n_real})"
             )
-        if batch_size > pool.padding_row:
+        if forward_batch.input_ids.numel() < raw_batch_size:
             raise RuntimeError(
-                "MOSS-TTS Local decode batch exceeds the staged decode-embedding "
-                f"rows ({batch_size} > {pool.padding_row})"
+                "MOSS-TTS Local decode input_ids must contain " "one row id per request"
             )
+        if staging_batch_size > max_rows:
+            raise RuntimeError(
+                "MOSS-TTS Local decode batch exceeds staging buffers "
+                f"({staging_batch_size} > {max_rows})"
+            )
+
+        pool = model._state_pool
         row_tensor, pool_rows, has_audio_repetition_penalty = pool.prepare_active_rows(
             requests
         )
+        staged_pool_rows = list(pool_rows)
+        if staging_batch_size > n_real:
+            staged_pool_rows.extend([pool.padding_row] * (staging_batch_size - n_real))
+        row_t = torch.tensor(
+            staged_pool_rows, dtype=torch.long, device=pool.feedback_embeds.device
+        )
+
         with torch.no_grad():
-            weight[:batch_size].copy_(pool.feedback_embeds[row_tensor])
+            model._cg_pool_rows[:staging_batch_size].copy_(
+                row_t.to(device=model._cg_pool_rows.device)
+            )
+            active_rows_t = model._cg_pool_rows[:staging_batch_size].to(
+                device=pool.feedback_embeds.device
+            )
+            model._cg_active_feedback_embeds[:staging_batch_size].copy_(
+                pool.feedback_embeds[active_rows_t].to(
+                    device=model._cg_active_feedback_embeds.device,
+                    dtype=model._cg_active_feedback_embeds.dtype,
+                )
+            )
+            model._cg_active_text_temp[:staging_batch_size].copy_(
+                pool.text_temp[active_rows_t].to(
+                    device=model._cg_active_text_temp.device,
+                    dtype=model._cg_active_text_temp.dtype,
+                )
+            )
+            model._cg_active_text_top_p[:staging_batch_size].copy_(
+                pool.text_top_p[active_rows_t].to(
+                    device=model._cg_active_text_top_p.device,
+                    dtype=model._cg_active_text_top_p.dtype,
+                )
+            )
+            model._cg_active_text_top_k[:staging_batch_size].copy_(
+                pool.text_top_k[active_rows_t].to(
+                    device=model._cg_active_text_top_k.device,
+                    dtype=model._cg_active_text_top_k.dtype,
+                )
+            )
+            model._cg_active_audio_temp[:staging_batch_size].copy_(
+                pool.audio_temp[active_rows_t].to(
+                    device=model._cg_active_audio_temp.device,
+                    dtype=model._cg_active_audio_temp.dtype,
+                )
+            )
+            model._cg_active_audio_top_p[:staging_batch_size].copy_(
+                pool.audio_top_p[active_rows_t].to(
+                    device=model._cg_active_audio_top_p.device,
+                    dtype=model._cg_active_audio_top_p.dtype,
+                )
+            )
+            model._cg_active_audio_top_k[:staging_batch_size].copy_(
+                pool.audio_top_k[active_rows_t].to(
+                    device=model._cg_active_audio_top_k.device,
+                    dtype=model._cg_active_audio_top_k.dtype,
+                )
+            )
+            model._cg_active_seeds[:staging_batch_size].copy_(
+                pool.seeds[active_rows_t].to(
+                    device=model._cg_active_seeds.device,
+                    dtype=model._cg_active_seeds.dtype,
+                )
+            )
+            model._cg_active_sampling_steps[:staging_batch_size].copy_(
+                pool.sampling_steps[active_rows_t].to(
+                    device=model._cg_active_sampling_steps.device,
+                    dtype=model._cg_active_sampling_steps.dtype,
+                )
+            )
+            model._cg_active_audio_repetition_penalty[:staging_batch_size].copy_(
+                pool.audio_repetition_penalty[active_rows_t].to(
+                    device=model._cg_active_audio_repetition_penalty.device,
+                    dtype=model._cg_active_audio_repetition_penalty.dtype,
+                )
+            )
+
+        row_ids = torch.arange(
+            raw_batch_size,
+            dtype=torch.long,
+            device=forward_batch.input_ids.device,
+        )
+        forward_batch.input_ids[:raw_batch_size].copy_(row_ids)
         forward_batch.moss_pool_row_t = row_tensor
         forward_batch.moss_pool_rows = pool_rows
         forward_batch.moss_has_audio_repetition_penalty = has_audio_repetition_penalty
 
-        row_ids = torch.arange(
-            batch_size,
-            dtype=torch.long,
-            device=forward_batch.input_ids.device,
-        )
-        forward_batch.input_ids[:batch_size].copy_(row_ids)
+        self._forward_sample_pool_rows = pool_rows
+        self._forward_sample_pool_row_t = row_tensor
+        self._forward_sample_rids = [sched_req.request_id for sched_req in requests]
+        self._forward_sample_native_decode = not has_audio_repetition_penalty
 
     def _collect_frame(
+        self,
+        result: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> None:
+        self._collect_frame_legacy(result, forward_batch, schedule_batch, requests)
+
+    def _collect_frame_from_forward_sample(
+        self,
+        result: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> None:
+        # Sampling already ran inside MossTTSLocalSGLangModel.forward() via the
+        # native decode-forward path. Collection only snapshots the fixed
+        # active-slot step buffers and publishes the graph-computed token ids.
+        if not requests:
+            return
+        n_real = len(requests)
+        current_rids = [sched_req.request_id for sched_req in requests]
+        staged_rids = list(getattr(self, "_forward_sample_rids", []))
+        pool_rows = list(getattr(self, "_forward_sample_pool_rows", []))
+        if staged_rids[:n_real] != current_rids:
+            raise RuntimeError(
+                "MOSS-TTS Local decode pool request alignment broken: "
+                f"{staged_rids[:n_real]} != {current_rids}"
+            )
+        if len(pool_rows) < n_real:
+            raise RuntimeError(
+                "MOSS-TTS Local decode pool row staging is incomplete: "
+                f"{len(pool_rows)} < {n_real}"
+            )
+
+        model = self.model
+        pool = model._state_pool
+        rows = model._cg_step_rows[:n_real]
+        next_token_ids = model._cg_step_next_token_ids[:n_real]
+        result.next_token_ids = next_token_ids
+        if schedule_batch is not None:
+            schedule_batch.output_ids = next_token_ids
+
+        emit_indices = [
+            i
+            for i, sched_req in enumerate(requests)
+            if not self._is_chunked_request(sched_req)
+        ]
+        if not emit_indices:
+            return
+
+        emit_index_t = torch.tensor(emit_indices, dtype=torch.long, device=rows.device)
+        emit_pool_rows = [pool_rows[i] for i in emit_indices]
+        cached_row_t = getattr(self, "_forward_sample_pool_row_t", None)
+        if isinstance(cached_row_t, torch.Tensor) and int(cached_row_t.numel()) >= n_real:
+            emit_row_t = cached_row_t.index_select(
+                0, emit_index_t.to(device=cached_row_t.device)
+            )
+        else:
+            emit_row_t = torch.tensor(
+                emit_pool_rows,
+                dtype=torch.long,
+                device=pool.feedback_embeds.device,
+            )
+        emit_row_t = emit_row_t.to(device=pool.feedback_embeds.device, dtype=torch.long)
+        pool.feedback_embeds[emit_row_t] = model._cg_active_next_feedback_embeds[
+            emit_index_t.to(device=model._cg_active_next_feedback_embeds.device)
+        ].to(device=pool.feedback_embeds.device, dtype=pool.feedback_embeds.dtype)
+        pool.sampling_steps[emit_row_t] = model._cg_active_next_sampling_steps[
+            emit_index_t.to(device=model._cg_active_next_sampling_steps.device)
+        ].to(device=pool.sampling_steps.device, dtype=torch.int64)
+        result.moss_journal = MossTTSLocalDecodeJournal(
+            rids=[requests[i].request_id for i in emit_indices],
+            pool_rows=emit_pool_rows,
+            rows=rows.index_select(0, emit_index_t),
+        )
+
+    def _collect_frame_legacy(
         self,
         result: Any,
         forward_batch: Any,
@@ -418,20 +619,31 @@ class MossTTSLocalModelRunner(ModelRunner):
         return rows, end_id
 
     def post_decode_launch(self, result: Any, forward_batch: Any, requests: list):
-        """Async-decode GPU half of ``post_decode``: run the frame micro-decode
-        (``_run_frame_decode``) and publish the device-computed radix ids, no
-        host sync. Returns a private device snapshot of those ids for resolve:
-        the base aliases ``next_token_ids`` onto ``output_ids``, which the next
-        step overwrites in place before this step's lagged resolve, clobbering
-        the stop id and silently dropping a bs=1 eos finish (4096-frame runaway).
-        The clone preserves it; resolve swaps it back.
+        """Async-decode GPU half of ``post_decode``: publish the native
+        forward-sampled frame ids, no host sync. Returns a private device
+        snapshot of those ids for resolve: the base aliases ``next_token_ids``
+        onto ``output_ids``, which the next step overwrites in place before this
+        step's lagged resolve, clobbering the stop id and silently dropping a
+        bs=1 eos finish (4096-frame runaway). The clone preserves it; resolve
+        swaps it back.
         """
         if not requests:
             return None
-        rows, end_id = self._run_frame_decode(result, forward_batch, requests)
-        next_token_ids = self._row_radix_token_ids(rows, rows[:, 0], end_id)
-        result.next_token_ids = next_token_ids
-        return next_token_ids.clone()
+        if (
+            not bool(getattr(self, "_forward_sample_native_decode", False))
+            or (
+                forward_batch is not None
+                and bool(
+                    getattr(forward_batch, "moss_has_audio_repetition_penalty", False)
+                )
+            )
+        ):
+            rows, end_id = self._run_frame_decode(result, forward_batch, requests)
+            next_token_ids = self._row_radix_token_ids(rows, rows[:, 0], end_id)
+            result.next_token_ids = next_token_ids
+            return next_token_ids.clone()
+        self._collect_frame_from_forward_sample(result, None, requests)
+        return result.next_token_ids.clone()
 
     def post_decode_resolve(
         self,

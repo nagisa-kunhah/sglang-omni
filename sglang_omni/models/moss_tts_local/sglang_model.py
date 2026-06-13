@@ -37,6 +37,7 @@ from sglang_omni.models.moss_tts_local.local_transformer import (
 from sglang_omni.models.moss_tts_local.payload_types import (
     moss_tts_local_special_token_defaults,
 )
+from sglang_omni.models.moss_tts_local.radix_hash import gpu_radix_row_hash
 from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeStatePool
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             dtype=weight.dtype,
         )
         self._decode_input_embedding.weight.requires_grad_(False)
+        self.init_forward_sample_buffers()
 
         # Row-indexed decode-state pool: next-step-critical per-request state
         # (next-frame feedback embedding, sampling params/seed, generation step)
@@ -137,6 +139,73 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         self._state_pool = MossTTSLocalDecodeStatePool(self)
         self._compiled_frame_sampler: Callable[..., torch.Tensor] | None = None
         self._frame_compile_configured = False
+
+    def init_forward_sample_buffers(self) -> None:
+        """Allocate fixed active-batch decode buffers for captured decode."""
+        weight = self._decode_input_embedding.weight
+        max_running_requests = int(weight.shape[0])
+        device = weight.device
+        dtype = weight.dtype
+        # The pool has max_running_requests + 1 rows; the last row is reserved
+        # for CUDA graph padding. The pool may not be constructed yet, but its
+        # padding row is therefore exactly max_running_requests.
+        self._cg_pool_rows = torch.full(
+            (max_running_requests,),
+            max_running_requests,
+            device=device,
+            dtype=torch.int64,
+        )
+        self._cg_active_feedback_embeds = torch.zeros(
+            max_running_requests,
+            self.hidden_size,
+            device=device,
+            dtype=dtype,
+        )
+        self._cg_active_text_temp = torch.ones(
+            max_running_requests, device=device, dtype=torch.float32
+        )
+        self._cg_active_text_top_p = torch.ones(
+            max_running_requests, device=device, dtype=torch.float32
+        )
+        self._cg_active_audio_temp = torch.ones(
+            max_running_requests, device=device, dtype=torch.float32
+        )
+        self._cg_active_audio_top_p = torch.ones(
+            max_running_requests, device=device, dtype=torch.float32
+        )
+        self._cg_active_text_top_k = torch.full(
+            (max_running_requests,), 50, device=device, dtype=torch.int64
+        )
+        self._cg_active_audio_top_k = torch.full(
+            (max_running_requests,), 25, device=device, dtype=torch.int64
+        )
+        self._cg_active_seeds = torch.zeros(
+            max_running_requests, device=device, dtype=torch.int64
+        )
+        self._cg_active_sampling_steps = torch.zeros(
+            max_running_requests, device=device, dtype=torch.int64
+        )
+        self._cg_active_audio_repetition_penalty = torch.ones(
+            max_running_requests, device=device, dtype=torch.float32
+        )
+        self._cg_active_next_feedback_embeds = torch.zeros(
+            max_running_requests,
+            self.hidden_size,
+            device=device,
+            dtype=dtype,
+        )
+        self._cg_active_next_sampling_steps = torch.zeros(
+            max_running_requests, device=device, dtype=torch.int64
+        )
+        self._cg_step_rows = torch.zeros(
+            max_running_requests,
+            int(self.n_vq) + 1,
+            device=device,
+            dtype=torch.int64,
+        )
+        self._cg_step_next_token_ids = torch.zeros(
+            max_running_requests, device=device, dtype=torch.int64
+        )
 
     def acquire_row(self, rid: str) -> int:
         """Assign (or return the existing) decode-state pool row for ``rid``."""
@@ -279,6 +348,39 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             embeds = embeds + embed_layer(input_ids_2d[:, idx])
         return embeds
 
+    def _decode_pool_state(
+        self,
+    ) -> tuple[torch.Tensor, MossTTSLocalDecodeStatePool]:
+        if not hasattr(self, "_cg_pool_rows"):
+            raise RuntimeError("MOSS-TTS Local decode pool rows are not initialized")
+        if not hasattr(self, "_state_pool"):
+            raise RuntimeError("MOSS-TTS Local decode state pool is not initialized")
+        return self._cg_pool_rows, self._state_pool
+
+    def _check_active_decode_buffers(self) -> None:
+        required = (
+            "_cg_active_feedback_embeds",
+            "_cg_active_text_temp",
+            "_cg_active_text_top_p",
+            "_cg_active_text_top_k",
+            "_cg_active_audio_temp",
+            "_cg_active_audio_top_p",
+            "_cg_active_audio_top_k",
+            "_cg_active_seeds",
+            "_cg_active_sampling_steps",
+            "_cg_active_audio_repetition_penalty",
+            "_cg_active_next_feedback_embeds",
+            "_cg_active_next_sampling_steps",
+            "_cg_step_rows",
+            "_cg_step_next_token_ids",
+        )
+        missing = [name for name in required if not hasattr(self, name)]
+        if missing:
+            raise RuntimeError(
+                "MOSS-TTS Local active decode buffers are not initialized: "
+                + ", ".join(missing)
+            )
+
     @torch.no_grad()
     def forward(
         self,
@@ -290,15 +392,17 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         input_embeds_are_projected: bool = False,
     ) -> LogitsProcessorOutput:
         del input_embeds_are_projected
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        is_decode = (
+            forward_mode is not None
+            and hasattr(forward_mode, "is_decode")
+            and bool(forward_mode.is_decode())
+        )
         if input_embeds is None:
-            forward_mode = getattr(forward_batch, "forward_mode", None)
-            is_decode = (
-                forward_mode is not None
-                and hasattr(forward_mode, "is_decode")
-                and bool(forward_mode.is_decode())
-            )
             if is_decode:
-                input_embeds = self._decode_input_embedding(input_ids)
+                self._check_active_decode_buffers()
+                batch_size = int(input_ids.shape[0])
+                input_embeds = self._cg_active_feedback_embeds[:batch_size]
             elif self.pp_group.is_first_rank:
                 input_embeds = self._prepare_multi_modal_inputs(input_ids)
             else:
@@ -318,10 +422,46 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             hidden_states,
             forward_batch,
         )
-        # The local-transformer frame decode (binary stop head + 12 sequential
-        # codebook samples) runs in the model runner after the graph-captured
-        # backbone returns; emitting hidden states with dummy logits keeps the
-        # backbone CUDA-graph replay free of model-specific outputs.
+        if is_decode:
+            batch_size = int(sample_hidden_states.shape[0])
+            self._check_active_decode_buffers()
+            num_channels = int(self.n_vq) + 1
+            active_sampling_steps = self._cg_active_sampling_steps[:batch_size]
+            base_positions = active_sampling_steps * num_channels
+            stop_choice, codes, feedback = self._decode_frame_graphable(
+                sample_hidden_states,
+                text_temperature=self._cg_active_text_temp[:batch_size],
+                text_top_p=self._cg_active_text_top_p[:batch_size],
+                text_top_k=self._cg_active_text_top_k[:batch_size],
+                audio_temperature=self._cg_active_audio_temp[:batch_size],
+                audio_top_p=self._cg_active_audio_top_p[:batch_size],
+                audio_top_k=self._cg_active_audio_top_k[:batch_size],
+                seeds=self._cg_active_seeds[:batch_size],
+                base_positions=base_positions,
+            )
+            slot_id = int(self.config.audio_assistant_slot_token_id)
+            end_id = int(self.config.audio_end_token_id)
+            next_text = torch.where(
+                stop_choice == 0,
+                torch.full_like(stop_choice, slot_id),
+                torch.full_like(stop_choice, end_id),
+            )
+            rows = self._cg_step_rows[:batch_size]
+            rows[:, 0] = next_text
+            rows[:, 1:] = codes
+            next_token_ids = gpu_radix_row_hash(rows, next_text, end_id)
+            self._cg_step_next_token_ids[:batch_size] = next_token_ids
+            self._cg_active_next_feedback_embeds[:batch_size] = feedback.to(
+                dtype=self._cg_active_next_feedback_embeds.dtype
+            )
+            self._cg_active_next_sampling_steps[:batch_size] = (
+                active_sampling_steps + 1
+            )
+
+        # Prefill flow consumes hidden_states in the model runner and samples
+        # there. Decode flow above has already written the sampled frame to
+        # fixed staging buffers. Dummy logits keep SGLang's output contract
+        # satisfied.
         dummy_logits = sample_hidden_states.new_empty(
             (sample_hidden_states.shape[0], 1)
         )

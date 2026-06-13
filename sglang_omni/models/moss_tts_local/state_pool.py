@@ -4,8 +4,8 @@
 Next-step-critical per-request decode state (the next frame's feedback
 embedding, request-static sampling parameters/seed, repetition penalty state,
 and generation step) lives in stable, process-lifetime GPU buffers indexed by a
-per-request row.
-Output-only frame collection moves to a per-step
+per-request row. The decode CUDA graph uses model-owned active-batch input and
+output buffers; output-only frame collection then snapshots those step buffers into a
 :class:`MossTTSLocalDecodeJournal`.
 
 ``P = max_running_requests + 1`` rows indexed by a per-request row. The last
@@ -97,13 +97,13 @@ class MossTTSLocalDecodeStatePool:
             device=self.device,
             dtype=torch.bool,
         )
-
         self._rid_to_row: dict[str, int] = {}
         self._params_written_rids: set[str] = set()
         self._audio_repetition_penalty_rows: set[int] = set()
         # Real rows 0..P-2 are assignable; the padding row stays out of the
         # free list so it is never handed to a request.
         self._free_rows: list[int] = list(range(self.padding_row))
+        self._set_padding_defaults()
 
     def acquire_row(self, rid: str) -> int:
         """Assign (or return the existing) row for ``rid``.
@@ -134,8 +134,16 @@ class MossTTSLocalDecodeStatePool:
         self._free_rows.append(row_idx)
 
     def reset_row(self, row_idx: int) -> None:
-        """Zero every field of ``row_idx`` (clears stranded feedback/params)."""
+        """Reset ``row_idx`` while preserving safe defaults for padding."""
         self.feedback_embeds[row_idx].zero_()
+        self.generation_steps[row_idx] = 0
+        self.sampling_steps[row_idx] = 0
+        self.audio_repetition_penalty[row_idx] = 0.0
+        self.audio_token_presence[row_idx].zero_()
+        self._audio_repetition_penalty_rows.discard(int(row_idx))
+        if row_idx == self.padding_row:
+            self._set_padding_defaults()
+            return
         self.text_temp[row_idx] = 0.0
         self.text_top_p[row_idx] = 0.0
         self.audio_temp[row_idx] = 0.0
@@ -143,9 +151,20 @@ class MossTTSLocalDecodeStatePool:
         self.text_top_k[row_idx] = 0
         self.audio_top_k[row_idx] = 0
         self.seeds[row_idx] = 0
+
+    def _set_padding_defaults(self) -> None:
+        """Sampling defaults used when CUDA graph buckets include padding."""
+        row_idx = self.padding_row
+        self.text_temp[row_idx] = 1.0
+        self.text_top_p[row_idx] = 1.0
+        self.text_top_k[row_idx] = 50
+        self.audio_temp[row_idx] = 1.0
+        self.audio_top_p[row_idx] = 1.0
+        self.audio_top_k[row_idx] = 25
+        self.seeds[row_idx] = 0
         self.generation_steps[row_idx] = 0
         self.sampling_steps[row_idx] = 0
-        self.audio_repetition_penalty[row_idx] = 0.0
+        self.audio_repetition_penalty[row_idx] = 1.0
         self.audio_token_presence[row_idx].zero_()
         self._audio_repetition_penalty_rows.discard(int(row_idx))
 
@@ -249,7 +268,7 @@ class MossTTSLocalDecodeStatePool:
         )
 
     def rebuild_audio_history(self, rid: str, output_rows: list[torch.Tensor]) -> bool:
-        """Rebuild ``rid``'s pool-resident history after retraction re-prefill."""
+        """Rebuild ``rid``'s audio history after retraction re-prefill."""
         row_idx = self.row_for(rid)
         if row_idx is None:
             return False
