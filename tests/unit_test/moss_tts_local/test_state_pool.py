@@ -58,6 +58,12 @@ def _init_active_decode_buffers(model: SimpleNamespace) -> None:
         dtype=torch.int64,
         device=device,
     )
+    model._cg_active_pool_rows_cached = torch.full(
+        (max_running_requests,), -1, dtype=torch.int64, device=device
+    )
+    model._cg_active_pool_row_versions_cached = torch.full(
+        (max_running_requests,), -1, dtype=torch.int64, device=device
+    )
     model._cg_active_feedback_embeds = torch.zeros(
         max_running_requests, hidden_size, dtype=dtype, device=device
     )
@@ -489,6 +495,9 @@ def _forward_sample_model(max_running_requests: int = 4) -> SimpleNamespace:
     model.device = torch.device("cpu")
     model._moss_local_decode_cuda_graph_bs = [1, 2, 4, 8, 16]
     model._moss_local_decode_graph_padding = False
+    model._moss_local_decode_graph_padding_ratio_threshold = 1.15
+    model._moss_local_forward_native_decode_enabled = False
+    model._moss_local_forward_native_decode_active = False
     model._state_pool = MossTTSLocalDecodeStatePool(model)
     _init_active_decode_buffers(model)
     return model
@@ -560,65 +569,18 @@ def test_before_decode_stages_forward_sample_buffers_and_padding():
         ],
     )
     torch.testing.assert_close(
-        model._cg_active_text_temp[:4],
+        pool.text_temp[torch.tensor([row_a, row_b])],
         torch.tensor(
             [
                 0.53,
                 0.55,
-                DEFAULT_SAMPLING_TEMPERATURE,
-                DEFAULT_SAMPLING_TEMPERATURE,
             ],
             dtype=torch.float32,
         ),
-    )
-    torch.testing.assert_close(
-        model._cg_active_text_top_p[:4],
-        torch.tensor([0.9, 0.9, DEFAULT_TOP_P, DEFAULT_TOP_P], dtype=torch.float32),
-    )
-    assert torch.equal(
-        model._cg_active_text_top_k[:4],
-        torch.tensor([43, 45, DEFAULT_TEXT_TOP_K, DEFAULT_TEXT_TOP_K]),
-    )
-    torch.testing.assert_close(
-        model._cg_active_audio_temp[:4],
-        torch.tensor(
-            [
-                1.7,
-                1.7,
-                DEFAULT_SAMPLING_TEMPERATURE,
-                DEFAULT_SAMPLING_TEMPERATURE,
-            ],
-            dtype=torch.float32,
-        ),
-    )
-    torch.testing.assert_close(
-        model._cg_active_audio_top_p[:4],
-        torch.tensor([0.8, 0.8, DEFAULT_TOP_P, DEFAULT_TOP_P], dtype=torch.float32),
-    )
-    assert torch.equal(
-        model._cg_active_audio_top_k[:4],
-        torch.tensor(
-            [DEFAULT_AUDIO_TOP_K, 17, DEFAULT_AUDIO_TOP_K, DEFAULT_AUDIO_TOP_K]
-        ),
-    )
-    assert torch.equal(
-        model._cg_active_seeds[:4],
-        torch.tensor([3, 5, DEFAULT_SAMPLING_SEED, DEFAULT_SAMPLING_SEED]),
     )
     assert torch.equal(
         model._cg_active_sampling_steps[:4],
         torch.tensor([2, 4, 0, 0], dtype=torch.long),
-    )
-    torch.testing.assert_close(
-        model._cg_active_audio_repetition_penalty[:4],
-        torch.tensor(
-            [DEFAULT_AUDIO_REPETITION_PENALTY] * 4,
-            dtype=torch.float32,
-        ),
-    )
-    torch.testing.assert_close(
-        pool.text_temp[torch.tensor([row_a, row_b])],
-        torch.tensor([0.53, 0.55], dtype=torch.float32),
     )
     assert torch.equal(
         pool.audio_top_k[torch.tensor([row_a, row_b])], torch.tensor([25, 17])
@@ -636,12 +598,15 @@ def test_before_decode_stages_forward_sample_buffers_and_padding():
     assert runner._forward_sample_pool_rows == [row_a, row_b]
     assert torch.equal(runner._forward_sample_pool_row_t, torch.tensor([row_a, row_b]))
     assert runner._forward_sample_rids == ["a", "b"]
+    assert runner._forward_sample_native_decode is False
+    assert model._moss_local_forward_native_decode_active is False
 
 
 def test_before_decode_stages_to_cuda_graph_bucket_when_padding_enabled():
     model = _forward_sample_model(max_running_requests=4)
     model._moss_local_decode_cuda_graph_bs = [1, 2, 4]
     model._moss_local_decode_graph_padding = True
+    model.frame_graph_max_bs = 4
     pool = model._state_pool
     row = pool.acquire_row("a")
     pool.feedback_embeds[row] = torch.arange(_HIDDEN, dtype=torch.bfloat16)
@@ -683,6 +648,103 @@ def test_before_decode_stages_to_cuda_graph_bucket_when_padding_enabled():
         ],
     )
     assert torch.equal(model._cg_active_sampling_steps[:4], torch.tensor([0, 0, 0, 0]))
+
+
+def test_decode_staging_batch_size_uses_graph_buckets_and_max_graph_bs():
+    model = _forward_sample_model(max_running_requests=16)
+    model._moss_local_decode_cuda_graph_bs = [1, 2, 4, 8, 16]
+    model.frame_graph_max_bs = 16
+    runner = object.__new__(MossTTSLocalModelRunner)
+    runner.model = model
+
+    model._moss_local_decode_graph_padding = False
+    assert runner._decode_staging_batch_size(15) == 15
+
+    model._moss_local_decode_graph_padding = True
+    assert runner._decode_staging_batch_size(15) == 16
+    assert runner._decode_staging_batch_size(9) == 16
+    assert runner._decode_staging_batch_size(17) == 17
+
+    model.frame_graph_max_bs = 8
+    assert runner._decode_staging_batch_size(15) == 15
+
+
+def test_forward_native_static_staging_cache_uses_pool_param_versions():
+    model = _forward_sample_model(max_running_requests=2)
+    model._moss_local_forward_native_decode_enabled = True
+    model.frame_graph_max_bs = 2
+    model._moss_local_decode_stats = {}
+    pool = model._state_pool
+    runner = object.__new__(MossTTSLocalModelRunner)
+    runner.model = model
+    request = SimpleNamespace(
+        request_id="rid", data=_decode_data(seed=3, generation_steps=0)
+    )
+    forward_batch = SimpleNamespace(input_ids=torch.full((1,), -1, dtype=torch.long))
+
+    runner.before_decode(forward_batch, SimpleNamespace(), [request])
+
+    row = pool.row_for("rid")
+    assert row is not None
+    assert runner._forward_sample_native_decode is True
+    assert model._moss_local_forward_native_decode_active is True
+    assert model._moss_local_decode_stats["static_stage_copy_slots"] == len(
+        MossTTSLocalModelRunner._STATIC_STAGE_FIELDS
+    )
+    assert float(model._cg_active_text_temp[0]) == float(pool.text_temp[row])
+    assert int(model._cg_active_seeds[0]) == 3
+
+    pool.sampling_steps[row] = 5
+    runner.before_decode(forward_batch, SimpleNamespace(), [request])
+
+    assert int(model._cg_active_sampling_steps[0]) == 5
+    assert model._moss_local_decode_stats["static_stage_copy_slots"] == len(
+        MossTTSLocalModelRunner._STATIC_STAGE_FIELDS
+    )
+
+    pool.write_params(row, _decode_data(seed=9, generation_steps=0))
+    runner.before_decode(forward_batch, SimpleNamespace(), [request])
+
+    assert int(model._cg_active_seeds[0]) == 9
+    assert model._moss_local_decode_stats["static_stage_copy_slots"] == 2 * len(
+        MossTTSLocalModelRunner._STATIC_STAGE_FIELDS
+    )
+
+
+def test_forward_native_gate_falls_back_for_penalty_and_oversized_batch():
+    model = _forward_sample_model(max_running_requests=4)
+    model._moss_local_forward_native_decode_enabled = True
+    model.frame_graph_max_bs = 4
+    runner = object.__new__(MossTTSLocalModelRunner)
+    runner.model = model
+    forward_batch = SimpleNamespace(
+        batch_size=1, input_ids=torch.full((1,), -1, dtype=torch.long)
+    )
+
+    request = SimpleNamespace(
+        request_id="penalty",
+        data=_decode_data(seed=1, generation_steps=0, audio_repetition_penalty=1.2),
+    )
+    runner.before_decode(forward_batch, SimpleNamespace(), [request])
+
+    assert runner._forward_sample_native_decode is False
+    assert model._moss_local_forward_native_decode_active is False
+
+    model = _forward_sample_model(max_running_requests=4)
+    model._moss_local_forward_native_decode_enabled = True
+    model.frame_graph_max_bs = 1
+    runner.model = model
+    requests = [
+        SimpleNamespace(request_id="a", data=_decode_data(seed=1, generation_steps=0)),
+        SimpleNamespace(request_id="b", data=_decode_data(seed=2, generation_steps=0)),
+    ]
+    forward_batch = SimpleNamespace(
+        batch_size=2, input_ids=torch.full((2,), -1, dtype=torch.long)
+    )
+    runner.before_decode(forward_batch, SimpleNamespace(), requests)
+
+    assert runner._forward_sample_native_decode is False
+    assert model._moss_local_forward_native_decode_active is False
 
 
 def test_fresh_row_zeros_feedback():
@@ -1531,6 +1593,7 @@ def test_native_decode_forward_uses_active_buffers_without_pool_writes():
     pool = MossTTSLocalDecodeStatePool(model)
     model._state_pool = pool
     _init_active_decode_buffers(model)
+    model._moss_local_forward_native_decode_active = True
 
     row = pool.acquire_row("rid")
     pool.write_params(row, _params(seed=7))
@@ -1620,6 +1683,7 @@ def test_native_decode_forward_outputs_active_buffers_for_fallback_without_pool_
     pool = MossTTSLocalDecodeStatePool(model)
     model._state_pool = pool
     _init_active_decode_buffers(model)
+    model._moss_local_forward_native_decode_active = False
 
     row = pool.acquire_row("rid")
     pool.write_params(row, _params(seed=7, audio_repetition_penalty=1.2))
@@ -1643,11 +1707,11 @@ def test_native_decode_forward_outputs_active_buffers_for_fallback_without_pool_
             return torch.ones((1, _HIDDEN), dtype=torch.bfloat16)
 
     model.model = _Backbone()
-    model._decode_frame_graphable = lambda hidden_states, **kwargs: (
-        torch.zeros(1, dtype=torch.long),
-        torch.full((1, 12), 7, dtype=torch.long),
-        torch.full((1, _HIDDEN), 3, dtype=torch.bfloat16),
-    )
+    def fail_decode_frame_graphable(hidden_states, **kwargs):
+        del hidden_states, kwargs
+        raise AssertionError("fallback forward must not run native frame decode")
+
+    model._decode_frame_graphable = fail_decode_frame_graphable
     model._select_sample_hidden_states = (
         lambda hidden_states, forward_batch: hidden_states
     )
@@ -1655,7 +1719,7 @@ def test_native_decode_forward_outputs_active_buffers_for_fallback_without_pool_
     forward_batch = SimpleNamespace(
         forward_mode=SimpleNamespace(is_decode=lambda: True)
     )
-    model.forward(
+    result = model.forward(
         torch.zeros(1, dtype=torch.long),
         torch.zeros(1, dtype=torch.long),
         forward_batch,
@@ -1663,15 +1727,13 @@ def test_native_decode_forward_outputs_active_buffers_for_fallback_without_pool_
 
     assert torch.equal(pool.feedback_embeds[row], original_feedback)
     assert int(pool.sampling_steps[row]) == 4
-    assert torch.equal(
-        model._cg_step_rows[0],
-        torch.cat([torch.tensor([1000]), torch.full((12,), 7, dtype=torch.long)]),
-    )
+    assert torch.equal(model._cg_step_rows[0], torch.zeros(13, dtype=torch.long))
     assert torch.equal(
         model._cg_active_next_feedback_embeds[0],
-        torch.full((_HIDDEN,), 3, dtype=torch.bfloat16),
+        torch.zeros(_HIDDEN, dtype=torch.bfloat16),
     )
-    assert int(model._cg_active_next_sampling_steps[0]) == 5
+    assert int(model._cg_active_next_sampling_steps[0]) == 0
+    assert torch.equal(result.hidden_states, torch.ones((1, _HIDDEN)).bfloat16())
 
 
 def test_post_prefill_collection_remains_eager_for_forward_sample_path():

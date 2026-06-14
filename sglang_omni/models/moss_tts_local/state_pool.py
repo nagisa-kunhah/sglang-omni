@@ -97,6 +97,9 @@ class MossTTSLocalDecodeStatePool:
         self.audio_repetition_penalty = torch.zeros(
             self.num_rows, device=self.device, dtype=torch.float32
         )
+        self.params_versions = torch.zeros(
+            self.num_rows, device=self.device, dtype=torch.int64
+        )
         self.audio_token_presence = torch.zeros(
             self.num_rows,
             self.n_vq,
@@ -147,6 +150,7 @@ class MossTTSLocalDecodeStatePool:
         self.sampling_steps[row_idx] = 0
         self.audio_repetition_penalty[row_idx] = 0.0
         self.audio_token_presence[row_idx].zero_()
+        self.params_versions[row_idx] += 1
         self._audio_repetition_penalty_rows.discard(int(row_idx))
         if row_idx == self.padding_row:
             self._set_padding_defaults()
@@ -198,6 +202,7 @@ class MossTTSLocalDecodeStatePool:
             self._audio_repetition_penalty_rows.discard(int(row_idx))
         else:
             self._audio_repetition_penalty_rows.add(int(row_idx))
+        self.params_versions[row_idx] += 1
 
     def ensure_params(self, row_idx: int, rid: str, data: Any) -> None:
         """Write request-static params once for the current row acquisition."""

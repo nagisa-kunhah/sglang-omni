@@ -87,6 +87,7 @@ def _load_moss_tts_local_processor(model_path: str, *, device: str) -> Any:
             processor = processor_cls.from_pretrained(
                 checkpoint_dir,
                 trust_remote_code=True,
+                codec_weight_dtype=None,
             )
     except Exception as exc:
         raise RuntimeError(_MOSS_TTS_LOCAL_INSTALL_HINT) from exc
@@ -488,6 +489,24 @@ def create_sglang_tts_engine_executor(
     }
     if server_args_overrides:
         overrides.update(server_args_overrides)
+    forward_native_decode_enabled = bool(
+        overrides.pop(
+            "forward_native_decode_enabled",
+            overrides.pop("moss_local_forward_native_decode_enabled", False),
+        )
+    )
+    decode_graph_padding = bool(
+        overrides.pop(
+            "decode_graph_padding",
+            overrides.pop("moss_local_decode_graph_padding", False),
+        )
+    )
+    decode_graph_padding_ratio_threshold = float(
+        overrides.pop(
+            "decode_graph_padding_ratio_threshold",
+            overrides.pop("moss_local_decode_graph_padding_ratio_threshold", 1.15),
+        )
+    )
 
     server_args = build_sglang_server_args(
         checkpoint_dir,
@@ -517,14 +536,21 @@ def create_sglang_tts_engine_executor(
         server_args.disable_cuda_graph = False
 
     model = model_worker.model_runner.model
+    model._moss_local_forward_native_decode_enabled = forward_native_decode_enabled
+    model._moss_local_forward_native_decode_active = False
+    model._moss_local_decode_graph_padding = False
+    model._moss_local_decode_graph_padding_ratio_threshold = (
+        decode_graph_padding_ratio_threshold
+    )
     if want_cuda_graph:
         model_worker.model_runner.init_device_graphs()
+        cuda_graph_bs = list(overrides.get("cuda_graph_bs") or [1, 2, 4, 8, 16])
+        model._moss_local_decode_cuda_graph_bs = cuda_graph_bs
+        model._moss_local_decode_graph_padding = decode_graph_padding
         # Also graph the per-frame local-transformer decode (1 + n_vq
         # micro-steps and 13 seeded sampling passes per frame): eager it is
         # kernel-launch-bound at ~22 ms/frame independent of batch size.
-        model.init_frame_decode_graphs(
-            list(overrides.get("cuda_graph_bs") or [1, 2, 4, 8, 16])
-        )
+        model.init_frame_decode_graphs(cuda_graph_bs)
 
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,

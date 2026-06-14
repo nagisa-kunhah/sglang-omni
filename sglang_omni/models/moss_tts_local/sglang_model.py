@@ -137,6 +137,11 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             dtype=weight.dtype,
         )
         self._decode_input_embedding.weight.requires_grad_(False)
+        self._moss_local_decode_cuda_graph_bs: list[int] = []
+        self._moss_local_decode_graph_padding = False
+        self._moss_local_decode_graph_padding_ratio_threshold = 1.15
+        self._moss_local_forward_native_decode_enabled = False
+        self._moss_local_forward_native_decode_active = False
         self.init_forward_sample_buffers()
 
         # Row-indexed decode-state pool: next-step-critical per-request state
@@ -164,6 +169,18 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         self._cg_pool_rows = torch.full(
             (max_running_requests,),
             max_running_requests,
+            device=device,
+            dtype=torch.int64,
+        )
+        self._cg_active_pool_rows_cached = torch.full(
+            (max_running_requests,),
+            -1,
+            device=device,
+            dtype=torch.int64,
+        )
+        self._cg_active_pool_row_versions_cached = torch.full(
+            (max_running_requests,),
+            -1,
             device=device,
             dtype=torch.int64,
         )
@@ -397,7 +414,6 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         )
         if input_embeds is None:
             if is_decode:
-                self._check_active_decode_buffers()
                 batch_size = int(input_ids.shape[0])
                 input_embeds = self._cg_active_feedback_embeds[:batch_size]
             elif self.pp_group.is_first_rank:
@@ -419,7 +435,9 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             hidden_states,
             forward_batch,
         )
-        if is_decode:
+        if is_decode and bool(
+            getattr(self, "_moss_local_forward_native_decode_active", False)
+        ):
             batch_size = int(sample_hidden_states.shape[0])
             num_channels = int(self.n_vq) + 1
             active_sampling_steps = self._cg_active_sampling_steps[:batch_size]
