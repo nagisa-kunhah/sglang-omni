@@ -357,30 +357,6 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             raise RuntimeError("MOSS-TTS Local decode state pool is not initialized")
         return self._cg_pool_rows, self._state_pool
 
-    def _check_active_decode_buffers(self) -> None:
-        required = (
-            "_cg_active_feedback_embeds",
-            "_cg_active_text_temp",
-            "_cg_active_text_top_p",
-            "_cg_active_text_top_k",
-            "_cg_active_audio_temp",
-            "_cg_active_audio_top_p",
-            "_cg_active_audio_top_k",
-            "_cg_active_seeds",
-            "_cg_active_sampling_steps",
-            "_cg_active_audio_repetition_penalty",
-            "_cg_active_next_feedback_embeds",
-            "_cg_active_next_sampling_steps",
-            "_cg_step_rows",
-            "_cg_step_next_token_ids",
-        )
-        missing = [name for name in required if not hasattr(self, name)]
-        if missing:
-            raise RuntimeError(
-                "MOSS-TTS Local active decode buffers are not initialized: "
-                + ", ".join(missing)
-            )
-
     @torch.no_grad()
     def forward(
         self,
