@@ -38,7 +38,15 @@ from sglang_omni.models.moss_tts_local.payload_types import (
     moss_tts_local_special_token_defaults,
 )
 from sglang_omni.models.moss_tts_local.radix_hash import gpu_radix_row_hash
-from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeStatePool
+from sglang_omni.models.moss_tts_local.state_pool import (
+    DEFAULT_AUDIO_REPETITION_PENALTY,
+    DEFAULT_AUDIO_TOP_K,
+    DEFAULT_SAMPLING_SEED,
+    DEFAULT_SAMPLING_TEMPERATURE,
+    DEFAULT_TEXT_TOP_K,
+    DEFAULT_TOP_P,
+    MossTTSLocalDecodeStatePool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,32 +173,50 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             device=device,
             dtype=dtype,
         )
-        self._cg_active_text_temp = torch.ones(
-            max_running_requests, device=device, dtype=torch.float32
+        self._cg_active_text_temp = torch.full(
+            (max_running_requests,),
+            DEFAULT_SAMPLING_TEMPERATURE,
+            device=device,
+            dtype=torch.float32,
         )
-        self._cg_active_text_top_p = torch.ones(
-            max_running_requests, device=device, dtype=torch.float32
+        self._cg_active_text_top_p = torch.full(
+            (max_running_requests,), DEFAULT_TOP_P, device=device, dtype=torch.float32
         )
-        self._cg_active_audio_temp = torch.ones(
-            max_running_requests, device=device, dtype=torch.float32
+        self._cg_active_audio_temp = torch.full(
+            (max_running_requests,),
+            DEFAULT_SAMPLING_TEMPERATURE,
+            device=device,
+            dtype=torch.float32,
         )
-        self._cg_active_audio_top_p = torch.ones(
-            max_running_requests, device=device, dtype=torch.float32
+        self._cg_active_audio_top_p = torch.full(
+            (max_running_requests,), DEFAULT_TOP_P, device=device, dtype=torch.float32
         )
         self._cg_active_text_top_k = torch.full(
-            (max_running_requests,), 50, device=device, dtype=torch.int64
+            (max_running_requests,),
+            DEFAULT_TEXT_TOP_K,
+            device=device,
+            dtype=torch.int64,
         )
         self._cg_active_audio_top_k = torch.full(
-            (max_running_requests,), 25, device=device, dtype=torch.int64
+            (max_running_requests,),
+            DEFAULT_AUDIO_TOP_K,
+            device=device,
+            dtype=torch.int64,
         )
-        self._cg_active_seeds = torch.zeros(
-            max_running_requests, device=device, dtype=torch.int64
+        self._cg_active_seeds = torch.full(
+            (max_running_requests,),
+            DEFAULT_SAMPLING_SEED,
+            device=device,
+            dtype=torch.int64,
         )
         self._cg_active_sampling_steps = torch.zeros(
             max_running_requests, device=device, dtype=torch.int64
         )
-        self._cg_active_audio_repetition_penalty = torch.ones(
-            max_running_requests, device=device, dtype=torch.float32
+        self._cg_active_audio_repetition_penalty = torch.full(
+            (max_running_requests,),
+            DEFAULT_AUDIO_REPETITION_PENALTY,
+            device=device,
+            dtype=torch.float32,
         )
         self._cg_active_next_feedback_embeds = torch.zeros(
             max_running_requests,
@@ -352,15 +378,6 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             embeds = embeds + embed_layer(input_ids_2d[:, idx])
         return embeds
 
-    def _decode_pool_state(
-        self,
-    ) -> tuple[torch.Tensor, MossTTSLocalDecodeStatePool]:
-        if not hasattr(self, "_cg_pool_rows"):
-            raise RuntimeError("MOSS-TTS Local decode pool rows are not initialized")
-        if not hasattr(self, "_state_pool"):
-            raise RuntimeError("MOSS-TTS Local decode state pool is not initialized")
-        return self._cg_pool_rows, self._state_pool
-
     @torch.no_grad()
     def forward(
         self,
@@ -435,10 +452,10 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             )
             self._cg_active_next_sampling_steps[:batch_size] = active_sampling_steps + 1
 
-        # Prefill flow consumes hidden_states in the model runner and samples
-        # there. Decode flow above has already written the sampled frame to
-        # fixed staging buffers. Dummy logits keep SGLang's output contract
-        # satisfied.
+        # Notes (Xinran): Prefill flow consumes hidden_states in the model
+        # runner and samples there. Decode flow above has already written the
+        # sampled frame to fixed staging buffers. Dummy logits keep SGLang's
+        # output contract satisfied.
         dummy_logits = sample_hidden_states.new_empty(
             (sample_hidden_states.shape[0], 1)
         )
@@ -599,21 +616,33 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                 "hidden_states": torch.zeros(
                     bucket, self.hidden_size, device=device, dtype=self.dtype
                 ),
-                "text_temperature": torch.ones(
-                    bucket, device=device, dtype=torch.float32
+                "text_temperature": torch.full(
+                    (bucket,),
+                    DEFAULT_SAMPLING_TEMPERATURE,
+                    device=device,
+                    dtype=torch.float32,
                 ),
-                "text_top_p": torch.ones(bucket, device=device, dtype=torch.float32),
+                "text_top_p": torch.full(
+                    (bucket,), DEFAULT_TOP_P, device=device, dtype=torch.float32
+                ),
                 "text_top_k": torch.full(
-                    (bucket,), 50, device=device, dtype=torch.long
+                    (bucket,), DEFAULT_TEXT_TOP_K, device=device, dtype=torch.long
                 ),
-                "audio_temperature": torch.ones(
-                    bucket, device=device, dtype=torch.float32
+                "audio_temperature": torch.full(
+                    (bucket,),
+                    DEFAULT_SAMPLING_TEMPERATURE,
+                    device=device,
+                    dtype=torch.float32,
                 ),
-                "audio_top_p": torch.ones(bucket, device=device, dtype=torch.float32),
+                "audio_top_p": torch.full(
+                    (bucket,), DEFAULT_TOP_P, device=device, dtype=torch.float32
+                ),
                 "audio_top_k": torch.full(
-                    (bucket,), 25, device=device, dtype=torch.long
+                    (bucket,), DEFAULT_AUDIO_TOP_K, device=device, dtype=torch.long
                 ),
-                "seeds": torch.zeros(bucket, device=device, dtype=torch.long),
+                "seeds": torch.full(
+                    (bucket,), DEFAULT_SAMPLING_SEED, device=device, dtype=torch.long
+                ),
                 "base_positions": torch.zeros(bucket, device=device, dtype=torch.long),
             }
             warmup_stream = torch.cuda.Stream()

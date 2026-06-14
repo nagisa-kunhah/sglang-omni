@@ -28,6 +28,19 @@ class MossTTSLocalModelRunner(ModelRunner):
     _outbox: Any | None = None
     _vocoder_target = "vocoder"
 
+    _STAGE_FIELDS = (
+        ("_cg_active_feedback_embeds", "feedback_embeds"),
+        ("_cg_active_text_temp", "text_temp"),
+        ("_cg_active_text_top_p", "text_top_p"),
+        ("_cg_active_text_top_k", "text_top_k"),
+        ("_cg_active_audio_temp", "audio_temp"),
+        ("_cg_active_audio_top_p", "audio_top_p"),
+        ("_cg_active_audio_top_k", "audio_top_k"),
+        ("_cg_active_seeds", "seeds"),
+        ("_cg_active_sampling_steps", "sampling_steps"),
+        ("_cg_active_audio_repetition_penalty", "audio_repetition_penalty"),
+    )
+
     def __init__(self, tp_worker: Any, output_processor: Any):
         super().__init__(tp_worker, output_processor)
         self._outbox: Any | None = None
@@ -248,66 +261,12 @@ class MossTTSLocalModelRunner(ModelRunner):
             active_rows_t = model._cg_pool_rows[:staging_batch_size].to(
                 device=pool.feedback_embeds.device
             )
-            model._cg_active_feedback_embeds[:staging_batch_size].copy_(
-                pool.feedback_embeds[active_rows_t].to(
-                    device=model._cg_active_feedback_embeds.device,
-                    dtype=model._cg_active_feedback_embeds.dtype,
+            for dst_name, src_name in self._STAGE_FIELDS:
+                dst = getattr(model, dst_name)
+                src = getattr(pool, src_name)
+                dst[:staging_batch_size].copy_(
+                    src[active_rows_t].to(device=dst.device, dtype=dst.dtype)
                 )
-            )
-            model._cg_active_text_temp[:staging_batch_size].copy_(
-                pool.text_temp[active_rows_t].to(
-                    device=model._cg_active_text_temp.device,
-                    dtype=model._cg_active_text_temp.dtype,
-                )
-            )
-            model._cg_active_text_top_p[:staging_batch_size].copy_(
-                pool.text_top_p[active_rows_t].to(
-                    device=model._cg_active_text_top_p.device,
-                    dtype=model._cg_active_text_top_p.dtype,
-                )
-            )
-            model._cg_active_text_top_k[:staging_batch_size].copy_(
-                pool.text_top_k[active_rows_t].to(
-                    device=model._cg_active_text_top_k.device,
-                    dtype=model._cg_active_text_top_k.dtype,
-                )
-            )
-            model._cg_active_audio_temp[:staging_batch_size].copy_(
-                pool.audio_temp[active_rows_t].to(
-                    device=model._cg_active_audio_temp.device,
-                    dtype=model._cg_active_audio_temp.dtype,
-                )
-            )
-            model._cg_active_audio_top_p[:staging_batch_size].copy_(
-                pool.audio_top_p[active_rows_t].to(
-                    device=model._cg_active_audio_top_p.device,
-                    dtype=model._cg_active_audio_top_p.dtype,
-                )
-            )
-            model._cg_active_audio_top_k[:staging_batch_size].copy_(
-                pool.audio_top_k[active_rows_t].to(
-                    device=model._cg_active_audio_top_k.device,
-                    dtype=model._cg_active_audio_top_k.dtype,
-                )
-            )
-            model._cg_active_seeds[:staging_batch_size].copy_(
-                pool.seeds[active_rows_t].to(
-                    device=model._cg_active_seeds.device,
-                    dtype=model._cg_active_seeds.dtype,
-                )
-            )
-            model._cg_active_sampling_steps[:staging_batch_size].copy_(
-                pool.sampling_steps[active_rows_t].to(
-                    device=model._cg_active_sampling_steps.device,
-                    dtype=model._cg_active_sampling_steps.dtype,
-                )
-            )
-            model._cg_active_audio_repetition_penalty[:staging_batch_size].copy_(
-                pool.audio_repetition_penalty[active_rows_t].to(
-                    device=model._cg_active_audio_repetition_penalty.device,
-                    dtype=model._cg_active_audio_repetition_penalty.dtype,
-                )
-            )
 
         row_ids = torch.arange(
             raw_batch_size,
@@ -339,9 +298,10 @@ class MossTTSLocalModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        # Sampling already ran inside MossTTSLocalSGLangModel.forward() via the
-        # native decode-forward path. Collection only snapshots the fixed
-        # active-slot step buffers and publishes the graph-computed token ids.
+        # Notes (Xinran): Sampling already ran inside
+        # MossTTSLocalSGLangModel.forward() via the native decode-forward path.
+        # Collection only snapshots the fixed active-slot step buffers and
+        # publishes the graph-computed token ids.
         if not requests:
             return
         n_real = len(requests)

@@ -20,6 +20,13 @@ from typing import Any
 
 import torch
 
+DEFAULT_SAMPLING_TEMPERATURE = 1.0
+DEFAULT_TOP_P = 1.0
+DEFAULT_TEXT_TOP_K = 50
+DEFAULT_AUDIO_TOP_K = 25
+DEFAULT_SAMPLING_SEED = 0
+DEFAULT_AUDIO_REPETITION_PENALTY = 1.0
+
 
 class MossTTSLocalDecodeStatePool:
     """Row-indexed pool of next-step-critical decode state.
@@ -155,16 +162,16 @@ class MossTTSLocalDecodeStatePool:
     def _set_padding_defaults(self) -> None:
         """Sampling defaults used when CUDA graph buckets include padding."""
         row_idx = self.padding_row
-        self.text_temp[row_idx] = 1.0
-        self.text_top_p[row_idx] = 1.0
-        self.text_top_k[row_idx] = 50
-        self.audio_temp[row_idx] = 1.0
-        self.audio_top_p[row_idx] = 1.0
-        self.audio_top_k[row_idx] = 25
-        self.seeds[row_idx] = 0
+        self.text_temp[row_idx] = DEFAULT_SAMPLING_TEMPERATURE
+        self.text_top_p[row_idx] = DEFAULT_TOP_P
+        self.text_top_k[row_idx] = DEFAULT_TEXT_TOP_K
+        self.audio_temp[row_idx] = DEFAULT_SAMPLING_TEMPERATURE
+        self.audio_top_p[row_idx] = DEFAULT_TOP_P
+        self.audio_top_k[row_idx] = DEFAULT_AUDIO_TOP_K
+        self.seeds[row_idx] = DEFAULT_SAMPLING_SEED
         self.generation_steps[row_idx] = 0
         self.sampling_steps[row_idx] = 0
-        self.audio_repetition_penalty[row_idx] = 1.0
+        self.audio_repetition_penalty[row_idx] = DEFAULT_AUDIO_REPETITION_PENALTY
         self.audio_token_presence[row_idx].zero_()
         self._audio_repetition_penalty_rows.discard(int(row_idx))
 
