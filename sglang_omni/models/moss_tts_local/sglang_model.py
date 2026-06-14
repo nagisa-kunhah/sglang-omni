@@ -146,9 +146,13 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         max_running_requests = int(weight.shape[0])
         device = weight.device
         dtype = weight.dtype
-        # The pool has max_running_requests + 1 rows; the last row is reserved
-        # for CUDA graph padding. The pool may not be constructed yet, but its
-        # padding row is therefore exactly max_running_requests.
+        # Notes (Xinran): These tensors are model-owned active-slot staging
+        # buffers. before_decode copies request-owned pool state into the
+        # active input buffers, forward() writes one step of sampled rows and
+        # next-step feedback into the output buffers, and collection commits
+        # those outputs back to the durable pool rows. The default pool row is
+        # max_running_requests, which is the reserved padding row once the pool
+        # is constructed.
         self._cg_pool_rows = torch.full(
             (max_running_requests,),
             max_running_requests,
@@ -429,9 +433,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             self._cg_active_next_feedback_embeds[:batch_size] = feedback.to(
                 dtype=self._cg_active_next_feedback_embeds.dtype
             )
-            self._cg_active_next_sampling_steps[:batch_size] = (
-                active_sampling_steps + 1
-            )
+            self._cg_active_next_sampling_steps[:batch_size] = active_sampling_steps + 1
 
         # Prefill flow consumes hidden_states in the model runner and samples
         # there. Decode flow above has already written the sampled frame to
