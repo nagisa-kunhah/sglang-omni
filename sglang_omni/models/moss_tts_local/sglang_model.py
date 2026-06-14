@@ -400,7 +400,6 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         )
         if is_decode:
             batch_size = int(sample_hidden_states.shape[0])
-            self._check_active_decode_buffers()
             num_channels = int(self.n_vq) + 1
             active_sampling_steps = self._cg_active_sampling_steps[:batch_size]
             base_positions = active_sampling_steps * num_channels
