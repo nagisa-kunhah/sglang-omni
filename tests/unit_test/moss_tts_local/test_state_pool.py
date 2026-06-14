@@ -636,9 +636,7 @@ def test_before_decode_stages_to_cuda_graph_bucket_when_padding_enabled():
             torch.tensor([row, pool.padding_row, pool.padding_row, pool.padding_row])
         ],
     )
-    assert torch.equal(
-        model._cg_active_sampling_steps[:4], torch.tensor([0, 0, 0, 0])
-    )
+    assert torch.equal(model._cg_active_sampling_steps[:4], torch.tensor([0, 0, 0, 0]))
 
 
 def test_fresh_row_zeros_feedback():
@@ -720,7 +718,7 @@ def test_double_collect_overwrites_feedback():
             logits_output=SimpleNamespace(hidden_states=torch.zeros(1, hidden_size))
         )
         schedule_batch = SimpleNamespace()
-        runner._collect_frame_legacy(result, None, schedule_batch, [request])
+        runner._collect_frame_eager(result, None, schedule_batch, [request])
 
     row = pool.row_for("rid")
     assert row is not None
@@ -993,7 +991,7 @@ def test_cached_pool_rows_drive_collect_and_batched_step_commit():
     ]
 
     forward_batch = SimpleNamespace(input_ids=torch.full((2,), -1, dtype=torch.long))
-    runner._write_decode_input_embedding(forward_batch, requests)
+    runner._prepare_forward_sample_inputs(forward_batch, requests)
 
     row_t = forward_batch.moss_pool_row_t.clone()
     row_a, row_b = int(row_t[0]), int(row_t[1])
@@ -1215,7 +1213,7 @@ def test_collect_frame_skips_chunked_feedback_and_journal():
     )
     schedule_batch = SimpleNamespace()
 
-    runner._collect_frame_legacy(result, None, schedule_batch, requests)
+    runner._collect_frame_eager(result, None, schedule_batch, requests)
 
     chunked_row = pool.row_for("chunked")
     normal_row = pool.row_for("normal")
@@ -1344,7 +1342,7 @@ def test_resume_with_empty_output_rows_still_resets_sampling_steps():
     assert data.sampling_steps == 1
 
 
-def test_forward_sample_collect_matches_legacy_graph_collect():
+def test_forward_sample_collect_matches_eager_graph_collect():
     def make_runner_and_model():
         model = _forward_sample_model(max_running_requests=4)
         model.frame_graph_max_bs = 4
@@ -1378,21 +1376,21 @@ def test_forward_sample_collect_matches_legacy_graph_collect():
             ),
         ]
 
-    legacy_runner, legacy_model = make_runner_and_model()
+    eager_runner, eager_model = make_runner_and_model()
 
     def decode_frame_graphed(hidden_states, **kwargs):
         del hidden_states, kwargs
         return stop_choice, codes, feedback
 
-    legacy_model.decode_frame_graphed = decode_frame_graphed
-    legacy_result = SimpleNamespace(
+    eager_model.decode_frame_graphed = decode_frame_graphed
+    eager_result = SimpleNamespace(
         logits_output=SimpleNamespace(hidden_states=torch.zeros(2, _HIDDEN))
     )
-    legacy_batch = SimpleNamespace()
-    legacy_requests = requests()
+    eager_batch = SimpleNamespace()
+    eager_requests = requests()
 
-    legacy_runner._collect_frame_legacy(
-        legacy_result, SimpleNamespace(), legacy_batch, legacy_requests
+    eager_runner._collect_frame_eager(
+        eager_result, SimpleNamespace(), eager_batch, eager_requests
     )
 
     new_runner, new_model = make_runner_and_model()
@@ -1404,7 +1402,7 @@ def test_forward_sample_collect_matches_legacy_graph_collect():
     new_runner.before_decode(forward_batch, SimpleNamespace(), new_requests)
     new_pool = new_model._state_pool
     new_model._cg_step_rows[:2] = rows
-    new_model._cg_step_next_token_ids[:2] = legacy_result.next_token_ids
+    new_model._cg_step_next_token_ids[:2] = eager_result.next_token_ids
     new_model._cg_active_next_feedback_embeds[:2] = feedback
     new_model._cg_active_next_sampling_steps[:2] = torch.tensor([1, 1])
     new_result = SimpleNamespace(logits_output=SimpleNamespace())
@@ -1412,15 +1410,15 @@ def test_forward_sample_collect_matches_legacy_graph_collect():
 
     new_runner._collect_frame_from_forward_sample(new_result, new_batch, new_requests)
 
-    assert torch.equal(new_result.next_token_ids, legacy_result.next_token_ids)
-    assert torch.equal(new_batch.output_ids, legacy_batch.output_ids)
-    assert new_result.moss_journal.rids == legacy_result.moss_journal.rids
-    assert new_result.moss_journal.pool_rows == legacy_result.moss_journal.pool_rows
-    assert torch.equal(new_result.moss_journal.rows, legacy_result.moss_journal.rows)
+    assert torch.equal(new_result.next_token_ids, eager_result.next_token_ids)
+    assert torch.equal(new_batch.output_ids, eager_batch.output_ids)
+    assert new_result.moss_journal.rids == eager_result.moss_journal.rids
+    assert new_result.moss_journal.pool_rows == eager_result.moss_journal.pool_rows
+    assert torch.equal(new_result.moss_journal.rows, eager_result.moss_journal.rows)
     assert torch.equal(
         new_model._state_pool.feedback_embeds[new_model._state_pool.row_for("normal")],
-        legacy_model._state_pool.feedback_embeds[
-            legacy_model._state_pool.row_for("normal")
+        eager_model._state_pool.feedback_embeds[
+            eager_model._state_pool.row_for("normal")
         ],
     )
     assert torch.equal(
@@ -1429,13 +1427,13 @@ def test_forward_sample_collect_matches_legacy_graph_collect():
     )
 
 
-def test_decode_collect_routes_repetition_penalty_to_legacy_fallback():
+def test_decode_collect_routes_repetition_penalty_to_eager_fallback():
     model = _forward_sample_model(max_running_requests=2)
     pool = model._state_pool
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
     calls = []
-    runner._collect_frame_legacy = lambda *args: calls.append("legacy")
+    runner._collect_frame_eager = lambda *args: calls.append("eager")
     runner._collect_frame_from_forward_sample = lambda *args: calls.append("pool")
     request = SimpleNamespace(
         request_id="rid",
@@ -1464,15 +1462,13 @@ def test_decode_collect_routes_repetition_penalty_to_legacy_fallback():
         [request],
     )
 
-    assert calls == ["legacy"]
+    assert calls == ["eager"]
     assert torch.equal(pool.feedback_embeds[row], original_feedback)
     assert torch.equal(pool.sampling_steps[row], original_sampling_steps)
 
 
 def test_native_decode_forward_uses_active_buffers_without_pool_writes():
-    from sglang_omni.models.moss_tts_local.sglang_model import (
-        MossTTSLocalSGLangModel,
-    )
+    from sglang_omni.models.moss_tts_local.sglang_model import MossTTSLocalSGLangModel
 
     model = object.__new__(MossTTSLocalSGLangModel)
     torch.nn.Module.__init__(model)
@@ -1561,9 +1557,7 @@ def test_native_decode_forward_uses_active_buffers_without_pool_writes():
 
 
 def test_native_decode_forward_outputs_active_buffers_for_fallback_without_pool_writes():
-    from sglang_omni.models.moss_tts_local.sglang_model import (
-        MossTTSLocalSGLangModel,
-    )
+    from sglang_omni.models.moss_tts_local.sglang_model import MossTTSLocalSGLangModel
 
     model = object.__new__(MossTTSLocalSGLangModel)
     torch.nn.Module.__init__(model)
@@ -1634,12 +1628,12 @@ def test_native_decode_forward_outputs_active_buffers_for_fallback_without_pool_
     assert int(model._cg_active_next_sampling_steps[0]) == 5
 
 
-def test_post_prefill_collection_remains_legacy_for_forward_sample_path():
+def test_post_prefill_collection_remains_eager_for_forward_sample_path():
     model = _forward_sample_model(max_running_requests=2)
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
     calls = []
-    runner._collect_frame_legacy = lambda *args: calls.append("legacy")
+    runner._collect_frame_eager = lambda *args: calls.append("eager")
     runner._collect_frame_from_forward_sample = lambda *args: calls.append("pool")
     request = SimpleNamespace(
         request_id="rid",
@@ -1652,7 +1646,7 @@ def test_post_prefill_collection_remains_legacy_for_forward_sample_path():
 
     runner.post_prefill(result, forward_batch, SimpleNamespace(), [request])
 
-    assert calls == ["legacy"]
+    assert calls == ["eager"]
 
 
 def test_journal_rid_assertion_fires():

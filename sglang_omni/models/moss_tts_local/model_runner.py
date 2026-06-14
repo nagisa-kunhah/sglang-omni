@@ -73,7 +73,7 @@ class MossTTSLocalModelRunner(ModelRunner):
             is_prefill_only = False
         if bool(is_prefill_only):
             return
-        self._collect_frame_legacy(result, forward_batch, schedule_batch, requests)
+        self._collect_frame_eager(result, forward_batch, schedule_batch, requests)
 
     def post_decode(
         self,
@@ -83,7 +83,7 @@ class MossTTSLocalModelRunner(ModelRunner):
         requests: list,
     ) -> None:
         if bool(getattr(forward_batch, "moss_has_audio_repetition_penalty", False)):
-            self._collect_frame_legacy(result, forward_batch, schedule_batch, requests)
+            self._collect_frame_eager(result, forward_batch, schedule_batch, requests)
             return
         self._collect_frame_from_forward_sample(result, schedule_batch, requests)
 
@@ -173,13 +173,6 @@ class MossTTSLocalModelRunner(ModelRunner):
             device=forward_batch.input_ids.device,
             dtype=self.model.dtype,
         )
-
-    def _write_decode_input_embedding(
-        self,
-        forward_batch: Any,
-        requests: list,
-    ) -> None:
-        self._prepare_forward_sample_inputs(forward_batch, requests)
 
     def _decode_staging_batch_size(self, raw_batch_size: int) -> int:
         """Return the model-buffer rows SGLang may read for this decode step.
@@ -338,7 +331,7 @@ class MossTTSLocalModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        self._collect_frame_legacy(result, forward_batch, schedule_batch, requests)
+        self._collect_frame_eager(result, forward_batch, schedule_batch, requests)
 
     def _collect_frame_from_forward_sample(
         self,
@@ -385,7 +378,10 @@ class MossTTSLocalModelRunner(ModelRunner):
         emit_index_t = torch.tensor(emit_indices, dtype=torch.long, device=rows.device)
         emit_pool_rows = [pool_rows[i] for i in emit_indices]
         cached_row_t = getattr(self, "_forward_sample_pool_row_t", None)
-        if isinstance(cached_row_t, torch.Tensor) and int(cached_row_t.numel()) >= n_real:
+        if (
+            isinstance(cached_row_t, torch.Tensor)
+            and int(cached_row_t.numel()) >= n_real
+        ):
             emit_row_t = cached_row_t.index_select(
                 0, emit_index_t.to(device=cached_row_t.device)
             )
@@ -408,7 +404,7 @@ class MossTTSLocalModelRunner(ModelRunner):
             rows=rows.index_select(0, emit_index_t),
         )
 
-    def _collect_frame_legacy(
+    def _collect_frame_eager(
         self,
         result: Any,
         forward_batch: Any,
@@ -629,14 +625,9 @@ class MossTTSLocalModelRunner(ModelRunner):
         """
         if not requests:
             return None
-        if (
-            not bool(getattr(self, "_forward_sample_native_decode", False))
-            or (
-                forward_batch is not None
-                and bool(
-                    getattr(forward_batch, "moss_has_audio_repetition_penalty", False)
-                )
-            )
+        if not bool(getattr(self, "_forward_sample_native_decode", False)) or (
+            forward_batch is not None
+            and bool(getattr(forward_batch, "moss_has_audio_repetition_penalty", False))
         ):
             rows, end_id = self._run_frame_decode(result, forward_batch, requests)
             next_token_ids = self._row_radix_token_ids(rows, rows[:, 0], end_id)
