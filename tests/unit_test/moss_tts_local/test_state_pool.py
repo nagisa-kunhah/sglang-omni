@@ -18,6 +18,12 @@ from sglang_omni.models.moss_tts_local.request_builders import (
     make_moss_tts_local_scheduler_adapters,
 )
 from sglang_omni.models.moss_tts_local.state_pool import (
+    DEFAULT_AUDIO_REPETITION_PENALTY,
+    DEFAULT_AUDIO_TOP_K,
+    DEFAULT_SAMPLING_SEED,
+    DEFAULT_SAMPLING_TEMPERATURE,
+    DEFAULT_TEXT_TOP_K,
+    DEFAULT_TOP_P,
     MossTTSLocalDecodeJournal,
     MossTTSLocalDecodeStatePool,
 )
@@ -55,32 +61,44 @@ def _init_active_decode_buffers(model: SimpleNamespace) -> None:
     model._cg_active_feedback_embeds = torch.zeros(
         max_running_requests, hidden_size, dtype=dtype, device=device
     )
-    model._cg_active_text_temp = torch.ones(
-        max_running_requests, dtype=torch.float32, device=device
+    model._cg_active_text_temp = torch.full(
+        (max_running_requests,),
+        DEFAULT_SAMPLING_TEMPERATURE,
+        dtype=torch.float32,
+        device=device,
     )
-    model._cg_active_text_top_p = torch.ones(
-        max_running_requests, dtype=torch.float32, device=device
+    model._cg_active_text_top_p = torch.full(
+        (max_running_requests,), DEFAULT_TOP_P, dtype=torch.float32, device=device
     )
-    model._cg_active_audio_temp = torch.ones(
-        max_running_requests, dtype=torch.float32, device=device
+    model._cg_active_audio_temp = torch.full(
+        (max_running_requests,),
+        DEFAULT_SAMPLING_TEMPERATURE,
+        dtype=torch.float32,
+        device=device,
     )
-    model._cg_active_audio_top_p = torch.ones(
-        max_running_requests, dtype=torch.float32, device=device
+    model._cg_active_audio_top_p = torch.full(
+        (max_running_requests,), DEFAULT_TOP_P, dtype=torch.float32, device=device
     )
     model._cg_active_text_top_k = torch.full(
-        (max_running_requests,), 50, dtype=torch.int64, device=device
+        (max_running_requests,), DEFAULT_TEXT_TOP_K, dtype=torch.int64, device=device
     )
     model._cg_active_audio_top_k = torch.full(
-        (max_running_requests,), 25, dtype=torch.int64, device=device
+        (max_running_requests,), DEFAULT_AUDIO_TOP_K, dtype=torch.int64, device=device
     )
-    model._cg_active_seeds = torch.zeros(
-        max_running_requests, dtype=torch.int64, device=device
+    model._cg_active_seeds = torch.full(
+        (max_running_requests,),
+        DEFAULT_SAMPLING_SEED,
+        dtype=torch.int64,
+        device=device,
     )
     model._cg_active_sampling_steps = torch.zeros(
         max_running_requests, dtype=torch.int64, device=device
     )
-    model._cg_active_audio_repetition_penalty = torch.ones(
-        max_running_requests, dtype=torch.float32, device=device
+    model._cg_active_audio_repetition_penalty = torch.full(
+        (max_running_requests,),
+        DEFAULT_AUDIO_REPETITION_PENALTY,
+        dtype=torch.float32,
+        device=device,
     )
     model._cg_active_next_feedback_embeds = torch.zeros(
         max_running_requests, hidden_size, dtype=dtype, device=device
@@ -148,20 +166,20 @@ def test_pool_dims_derive_from_embedding_weight():
 def test_padding_row_has_safe_sampling_defaults():
     pool = MossTTSLocalDecodeStatePool(_model(max_running_requests=4))
     row = pool.padding_row
-    assert pool.text_temp[row].item() == 1.0
-    assert pool.text_top_p[row].item() == 1.0
-    assert int(pool.text_top_k[row]) == 50
-    assert pool.audio_temp[row].item() == 1.0
-    assert pool.audio_top_p[row].item() == 1.0
-    assert int(pool.audio_top_k[row]) == 25
-    assert int(pool.seeds[row]) == 0
-    assert pool.audio_repetition_penalty[row].item() == 1.0
+    assert pool.text_temp[row].item() == DEFAULT_SAMPLING_TEMPERATURE
+    assert pool.text_top_p[row].item() == DEFAULT_TOP_P
+    assert int(pool.text_top_k[row]) == DEFAULT_TEXT_TOP_K
+    assert pool.audio_temp[row].item() == DEFAULT_SAMPLING_TEMPERATURE
+    assert pool.audio_top_p[row].item() == DEFAULT_TOP_P
+    assert int(pool.audio_top_k[row]) == DEFAULT_AUDIO_TOP_K
+    assert int(pool.seeds[row]) == DEFAULT_SAMPLING_SEED
+    assert pool.audio_repetition_penalty[row].item() == DEFAULT_AUDIO_REPETITION_PENALTY
 
     pool.text_temp[row] = 0.0
     pool.text_top_k[row] = 0
     pool.reset_row(row)
-    assert pool.text_temp[row].item() == 1.0
-    assert int(pool.text_top_k[row]) == 50
+    assert pool.text_temp[row].item() == DEFAULT_SAMPLING_TEMPERATURE
+    assert int(pool.text_top_k[row]) == DEFAULT_TEXT_TOP_K
 
 
 def test_acquire_is_idempotent_by_rid():
@@ -543,30 +561,49 @@ def test_before_decode_stages_forward_sample_buffers_and_padding():
     )
     torch.testing.assert_close(
         model._cg_active_text_temp[:4],
-        torch.tensor([0.53, 0.55, 1.0, 1.0], dtype=torch.float32),
+        torch.tensor(
+            [
+                0.53,
+                0.55,
+                DEFAULT_SAMPLING_TEMPERATURE,
+                DEFAULT_SAMPLING_TEMPERATURE,
+            ],
+            dtype=torch.float32,
+        ),
     )
     torch.testing.assert_close(
         model._cg_active_text_top_p[:4],
-        torch.tensor([0.9, 0.9, 1.0, 1.0], dtype=torch.float32),
+        torch.tensor([0.9, 0.9, DEFAULT_TOP_P, DEFAULT_TOP_P], dtype=torch.float32),
     )
     assert torch.equal(
         model._cg_active_text_top_k[:4],
-        torch.tensor([43, 45, 50, 50], dtype=torch.long),
+        torch.tensor([43, 45, DEFAULT_TEXT_TOP_K, DEFAULT_TEXT_TOP_K]),
     )
     torch.testing.assert_close(
         model._cg_active_audio_temp[:4],
-        torch.tensor([1.7, 1.7, 1.0, 1.0], dtype=torch.float32),
+        torch.tensor(
+            [
+                1.7,
+                1.7,
+                DEFAULT_SAMPLING_TEMPERATURE,
+                DEFAULT_SAMPLING_TEMPERATURE,
+            ],
+            dtype=torch.float32,
+        ),
     )
     torch.testing.assert_close(
         model._cg_active_audio_top_p[:4],
-        torch.tensor([0.8, 0.8, 1.0, 1.0], dtype=torch.float32),
+        torch.tensor([0.8, 0.8, DEFAULT_TOP_P, DEFAULT_TOP_P], dtype=torch.float32),
     )
     assert torch.equal(
         model._cg_active_audio_top_k[:4],
-        torch.tensor([25, 17, 25, 25], dtype=torch.long),
+        torch.tensor(
+            [DEFAULT_AUDIO_TOP_K, 17, DEFAULT_AUDIO_TOP_K, DEFAULT_AUDIO_TOP_K]
+        ),
     )
     assert torch.equal(
-        model._cg_active_seeds[:4], torch.tensor([3, 5, 0, 0], dtype=torch.long)
+        model._cg_active_seeds[:4],
+        torch.tensor([3, 5, DEFAULT_SAMPLING_SEED, DEFAULT_SAMPLING_SEED]),
     )
     assert torch.equal(
         model._cg_active_sampling_steps[:4],
@@ -574,7 +611,10 @@ def test_before_decode_stages_forward_sample_buffers_and_padding():
     )
     torch.testing.assert_close(
         model._cg_active_audio_repetition_penalty[:4],
-        torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float32),
+        torch.tensor(
+            [DEFAULT_AUDIO_REPETITION_PENALTY] * 4,
+            dtype=torch.float32,
+        ),
     )
     torch.testing.assert_close(
         pool.text_temp[torch.tensor([row_a, row_b])],
@@ -584,12 +624,15 @@ def test_before_decode_stages_forward_sample_buffers_and_padding():
         pool.audio_top_k[torch.tensor([row_a, row_b])], torch.tensor([25, 17])
     )
     assert torch.equal(pool.seeds[torch.tensor([row_a, row_b])], torch.tensor([3, 5]))
-    assert pool.text_temp[pool.padding_row].item() == 1.0
-    assert pool.audio_top_p[pool.padding_row].item() == 1.0
-    assert int(pool.text_top_k[pool.padding_row]) == 50
-    assert int(pool.audio_top_k[pool.padding_row]) == 25
-    assert int(pool.seeds[pool.padding_row]) == 0
-    assert pool.audio_repetition_penalty[pool.padding_row].item() == 1.0
+    assert pool.text_temp[pool.padding_row].item() == DEFAULT_SAMPLING_TEMPERATURE
+    assert pool.audio_top_p[pool.padding_row].item() == DEFAULT_TOP_P
+    assert int(pool.text_top_k[pool.padding_row]) == DEFAULT_TEXT_TOP_K
+    assert int(pool.audio_top_k[pool.padding_row]) == DEFAULT_AUDIO_TOP_K
+    assert int(pool.seeds[pool.padding_row]) == DEFAULT_SAMPLING_SEED
+    assert (
+        pool.audio_repetition_penalty[pool.padding_row].item()
+        == DEFAULT_AUDIO_REPETITION_PENALTY
+    )
     assert runner._forward_sample_pool_rows == [row_a, row_b]
     assert torch.equal(runner._forward_sample_pool_row_t, torch.tensor([row_a, row_b]))
     assert runner._forward_sample_rids == ["a", "b"]
@@ -625,11 +668,14 @@ def test_before_decode_stages_to_cuda_graph_bucket_when_padding_enabled():
         model._cg_pool_rows[:4],
         torch.tensor([row, pool.padding_row, pool.padding_row, pool.padding_row]),
     )
-    assert pool.text_temp[pool.padding_row].item() == 1.0
-    assert int(pool.text_top_k[pool.padding_row]) == 50
-    assert int(pool.audio_top_k[pool.padding_row]) == 25
-    assert int(pool.seeds[pool.padding_row]) == 0
-    assert pool.audio_repetition_penalty[pool.padding_row].item() == 1.0
+    assert pool.text_temp[pool.padding_row].item() == DEFAULT_SAMPLING_TEMPERATURE
+    assert int(pool.text_top_k[pool.padding_row]) == DEFAULT_TEXT_TOP_K
+    assert int(pool.audio_top_k[pool.padding_row]) == DEFAULT_AUDIO_TOP_K
+    assert int(pool.seeds[pool.padding_row]) == DEFAULT_SAMPLING_SEED
+    assert (
+        pool.audio_repetition_penalty[pool.padding_row].item()
+        == DEFAULT_AUDIO_REPETITION_PENALTY
+    )
     assert torch.equal(
         model._cg_active_feedback_embeds[:4],
         pool.feedback_embeds[
