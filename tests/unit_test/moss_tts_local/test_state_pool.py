@@ -58,12 +58,6 @@ def _init_active_decode_buffers(model: SimpleNamespace) -> None:
         dtype=torch.int64,
         device=device,
     )
-    model._cg_active_pool_rows_cached = torch.full(
-        (max_running_requests,), -1, dtype=torch.int64, device=device
-    )
-    model._cg_active_pool_row_versions_cached = torch.full(
-        (max_running_requests,), -1, dtype=torch.int64, device=device
-    )
     model._cg_active_feedback_embeds = torch.zeros(
         max_running_requests, hidden_size, dtype=dtype, device=device
     )
@@ -493,11 +487,8 @@ def _forward_sample_model(max_running_requests: int = 4) -> SimpleNamespace:
         audio_end_token_id=1001,
     )
     model.device = torch.device("cpu")
-    model._moss_local_decode_cuda_graph_bs = [1, 2, 4, 8, 16]
-    model._moss_local_decode_graph_padding = False
-    model._moss_local_decode_graph_padding_ratio_threshold = 1.15
-    model._moss_local_forward_native_decode_enabled = False
     model._moss_local_forward_native_decode_active = False
+    model._moss_local_native_decode_enabled = True
     model._state_pool = MossTTSLocalDecodeStatePool(model)
     _init_active_decode_buffers(model)
     return model
@@ -602,10 +593,8 @@ def test_before_decode_stages_forward_sample_buffers_and_padding():
     assert model._moss_local_forward_native_decode_active is False
 
 
-def test_before_decode_stages_to_cuda_graph_bucket_when_padding_enabled():
+def test_before_decode_pads_scheduler_slots_to_padding_row():
     model = _forward_sample_model(max_running_requests=4)
-    model._moss_local_decode_cuda_graph_bs = [1, 2, 4]
-    model._moss_local_decode_graph_padding = True
     model.frame_graph_max_bs = 4
     pool = model._state_pool
     row = pool.acquire_row("a")
@@ -630,8 +619,8 @@ def test_before_decode_stages_to_cuda_graph_bucket_when_padding_enabled():
     assert torch.equal(model._decode_input_embedding.weight, original_weight)
     assert torch.equal(forward_batch.input_ids, torch.tensor([0, 1, 2]))
     assert torch.equal(
-        model._cg_pool_rows[:4],
-        torch.tensor([row, pool.padding_row, pool.padding_row, pool.padding_row]),
+        model._cg_pool_rows[:3],
+        torch.tensor([row, pool.padding_row, pool.padding_row]),
     )
     assert pool.text_temp[pool.padding_row].item() == DEFAULT_SAMPLING_TEMPERATURE
     assert int(pool.text_top_k[pool.padding_row]) == DEFAULT_TEXT_TOP_K
@@ -642,38 +631,17 @@ def test_before_decode_stages_to_cuda_graph_bucket_when_padding_enabled():
         == DEFAULT_AUDIO_REPETITION_PENALTY
     )
     assert torch.equal(
-        model._cg_active_feedback_embeds[:4],
+        model._cg_active_feedback_embeds[:3],
         pool.feedback_embeds[
-            torch.tensor([row, pool.padding_row, pool.padding_row, pool.padding_row])
+            torch.tensor([row, pool.padding_row, pool.padding_row])
         ],
     )
-    assert torch.equal(model._cg_active_sampling_steps[:4], torch.tensor([0, 0, 0, 0]))
+    assert torch.equal(model._cg_active_sampling_steps[:3], torch.tensor([0, 0, 0]))
 
 
-def test_decode_staging_batch_size_uses_graph_buckets_and_max_graph_bs():
-    model = _forward_sample_model(max_running_requests=16)
-    model._moss_local_decode_cuda_graph_bs = [1, 2, 4, 8, 16]
-    model.frame_graph_max_bs = 16
-    runner = object.__new__(MossTTSLocalModelRunner)
-    runner.model = model
-
-    model._moss_local_decode_graph_padding = False
-    assert runner._decode_staging_batch_size(15) == 15
-
-    model._moss_local_decode_graph_padding = True
-    assert runner._decode_staging_batch_size(15) == 16
-    assert runner._decode_staging_batch_size(9) == 16
-    assert runner._decode_staging_batch_size(17) == 17
-
-    model.frame_graph_max_bs = 8
-    assert runner._decode_staging_batch_size(15) == 15
-
-
-def test_forward_native_static_staging_cache_uses_pool_param_versions():
+def test_forward_native_stages_static_sampling_params_every_step():
     model = _forward_sample_model(max_running_requests=2)
-    model._moss_local_forward_native_decode_enabled = True
     model.frame_graph_max_bs = 2
-    model._moss_local_decode_stats = {}
     pool = model._state_pool
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
@@ -688,32 +656,19 @@ def test_forward_native_static_staging_cache_uses_pool_param_versions():
     assert row is not None
     assert runner._forward_sample_native_decode is True
     assert model._moss_local_forward_native_decode_active is True
-    assert model._moss_local_decode_stats["static_stage_copy_slots"] == len(
-        MossTTSLocalModelRunner._STATIC_STAGE_FIELDS
-    )
     assert float(model._cg_active_text_temp[0]) == float(pool.text_temp[row])
     assert int(model._cg_active_seeds[0]) == 3
 
-    pool.sampling_steps[row] = 5
-    runner.before_decode(forward_batch, SimpleNamespace(), [request])
-
-    assert int(model._cg_active_sampling_steps[0]) == 5
-    assert model._moss_local_decode_stats["static_stage_copy_slots"] == len(
-        MossTTSLocalModelRunner._STATIC_STAGE_FIELDS
-    )
-
+    # No version cache: every step re-stages the static params straight from the
+    # pool, so a later param edit shows up on the next before_decode.
     pool.write_params(row, _decode_data(seed=9, generation_steps=0))
     runner.before_decode(forward_batch, SimpleNamespace(), [request])
 
     assert int(model._cg_active_seeds[0]) == 9
-    assert model._moss_local_decode_stats["static_stage_copy_slots"] == 2 * len(
-        MossTTSLocalModelRunner._STATIC_STAGE_FIELDS
-    )
 
 
 def test_forward_native_gate_falls_back_for_penalty_and_oversized_batch():
     model = _forward_sample_model(max_running_requests=4)
-    model._moss_local_forward_native_decode_enabled = True
     model.frame_graph_max_bs = 4
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
@@ -731,7 +686,6 @@ def test_forward_native_gate_falls_back_for_penalty_and_oversized_batch():
     assert model._moss_local_forward_native_decode_active is False
 
     model = _forward_sample_model(max_running_requests=4)
-    model._moss_local_forward_native_decode_enabled = True
     model.frame_graph_max_bs = 1
     runner.model = model
     requests = [
@@ -826,7 +780,7 @@ def test_double_collect_overwrites_feedback():
             logits_output=SimpleNamespace(hidden_states=torch.zeros(1, hidden_size))
         )
         schedule_batch = SimpleNamespace()
-        runner._collect_frame_eager(result, None, schedule_batch, [request])
+        runner._collect_frame_in_runner(result, None, schedule_batch, [request])
 
     row = pool.row_for("rid")
     assert row is not None
@@ -889,7 +843,7 @@ def test_collect_frame_reads_generation_steps_from_pool():
         logits_output=SimpleNamespace(hidden_states=torch.zeros(1, hidden_size))
     )
 
-    runner._collect_frame(result, SimpleNamespace(), SimpleNamespace(), [request])
+    runner._collect_frame_in_runner(result, SimpleNamespace(), SimpleNamespace(), [request])
 
     assert torch.equal(captured["base_positions"], torch.tensor([4 * 13]))
     assert int(pool.sampling_steps[row]) == 5
@@ -945,8 +899,8 @@ def test_pool_sampling_position_leads_unresolved_lookahead_launches():
         logits_output=SimpleNamespace(hidden_states=torch.zeros(1, hidden_size))
     )
 
-    runner._collect_frame(result, SimpleNamespace(), SimpleNamespace(), [request])
-    runner._collect_frame(result, SimpleNamespace(), SimpleNamespace(), [request])
+    runner._collect_frame_in_runner(result, SimpleNamespace(), SimpleNamespace(), [request])
+    runner._collect_frame_in_runner(result, SimpleNamespace(), SimpleNamespace(), [request])
 
     row = pool.row_for("rid")
     assert row is not None
@@ -1037,7 +991,7 @@ def test_collect_frame_uses_eager_path_when_audio_repetition_penalty_active(
         logits_output=SimpleNamespace(hidden_states=torch.zeros(1, hidden_size))
     )
 
-    runner._collect_frame(result, SimpleNamespace(), SimpleNamespace(), [request])
+    runner._collect_frame_in_runner(result, SimpleNamespace(), SimpleNamespace(), [request])
 
     assert called["eager"] is True
     assert len(sampled_audio_logits) == 1
@@ -1141,7 +1095,7 @@ def test_cached_pool_rows_drive_collect_and_batched_step_commit():
     schedule_batch = SimpleNamespace(is_prefill_only=False, output_ids=None)
     scheduler_output = SimpleNamespace(requests=requests)
 
-    runner._collect_frame(result, forward_batch, schedule_batch, requests)
+    runner._collect_frame_in_runner(result, forward_batch, schedule_batch, requests)
 
     assert torch.equal(captured["base_positions"], torch.tensor([4 * 13, 8 * 13]))
     assert result.moss_journal.pool_rows == [row_a, row_b]
@@ -1321,7 +1275,7 @@ def test_collect_frame_skips_chunked_feedback_and_journal():
     )
     schedule_batch = SimpleNamespace()
 
-    runner._collect_frame_eager(result, None, schedule_batch, requests)
+    runner._collect_frame_in_runner(result, None, schedule_batch, requests)
 
     chunked_row = pool.row_for("chunked")
     normal_row = pool.row_for("normal")
@@ -1497,7 +1451,7 @@ def test_forward_sample_collect_matches_eager_graph_collect():
     eager_batch = SimpleNamespace()
     eager_requests = requests()
 
-    eager_runner._collect_frame_eager(
+    eager_runner._collect_frame_in_runner(
         eager_result, SimpleNamespace(), eager_batch, eager_requests
     )
 
@@ -1541,7 +1495,7 @@ def test_decode_collect_routes_repetition_penalty_to_eager_fallback():
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
     calls = []
-    runner._collect_frame_eager = lambda *args: calls.append("eager")
+    runner._collect_frame_in_runner = lambda *args: calls.append("eager")
     runner._collect_frame_from_forward_sample = lambda *args: calls.append("pool")
     request = SimpleNamespace(
         request_id="rid",
@@ -1741,7 +1695,7 @@ def test_post_prefill_collection_remains_eager_for_forward_sample_path():
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
     calls = []
-    runner._collect_frame_eager = lambda *args: calls.append("eager")
+    runner._collect_frame_in_runner = lambda *args: calls.append("eager")
     runner._collect_frame_from_forward_sample = lambda *args: calls.append("pool")
     request = SimpleNamespace(
         request_id="rid",

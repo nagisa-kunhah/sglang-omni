@@ -137,10 +137,6 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             dtype=weight.dtype,
         )
         self._decode_input_embedding.weight.requires_grad_(False)
-        self._moss_local_decode_cuda_graph_bs: list[int] = []
-        self._moss_local_decode_graph_padding = False
-        self._moss_local_decode_graph_padding_ratio_threshold = 1.15
-        self._moss_local_forward_native_decode_enabled = False
         self._moss_local_forward_native_decode_active = False
         self.init_forward_sample_buffers()
 
@@ -169,18 +165,6 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         self._cg_pool_rows = torch.full(
             (max_running_requests,),
             max_running_requests,
-            device=device,
-            dtype=torch.int64,
-        )
-        self._cg_active_pool_rows_cached = torch.full(
-            (max_running_requests,),
-            -1,
-            device=device,
-            dtype=torch.int64,
-        )
-        self._cg_active_pool_row_versions_cached = torch.full(
-            (max_running_requests,),
-            -1,
             device=device,
             dtype=torch.int64,
         )
@@ -600,6 +584,26 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         return stop_choice, torch.stack(codes, dim=-1), feedback
 
     @torch.no_grad()
+    def prepare_frame_decode_for_capture(self, batch_sizes: list[int]) -> None:
+        """Size + freeze the local-transformer KV cache and compile the frame
+        sampler, sizing the KV for the largest batch any decode path can see.
+
+        Must run before *either* graph that contains the frame decode is
+        captured: the standalone frame graphs (``init_frame_decode_graphs``) and
+        the backbone decode graph when the native in-``forward()`` sampling path
+        is armed (the captured graph bakes in the ``_native_decode_active``
+        branch, so the local transformer must already be ready at capture).
+        """
+        buckets = sorted({int(bs) for bs in batch_sizes})
+        if not buckets:
+            return
+        max_eager_bs = int(self._decode_input_embedding.weight.shape[0])
+        self.local_transformer.reserve_and_freeze_kv_cache(
+            max(max(buckets), max_eager_bs), self.device, self.dtype
+        )
+        self._ensure_frame_sampler_compile()
+
+    @torch.no_grad()
     def init_frame_decode_graphs(self, batch_sizes: list[int]) -> None:
         """Capture the per-frame local decode (1 + n_vq micro-steps plus all
         13 seeded sampling passes) into one CUDA graph per batch-size bucket.
@@ -612,15 +616,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         if not buckets:
             return
         device = self.device
-        # The captured graphs hold raw pointers into the local KV buffers, so
-        # size them for the largest batch any path (graphed or eager fallback)
-        # can see and freeze them against reallocation.
-        max_eager_bs = int(self._decode_input_embedding.weight.shape[0])
-        self.local_transformer._ensure_kv_cache(
-            max(max(buckets), max_eager_bs), device, self.dtype
-        )
-        self.local_transformer.freeze_kv_cache()
-        self._ensure_frame_sampler_compile()
+        # Note(yichi): caller must prepare_frame_decode_for_capture before calling this.
         frame_decode = self._decode_frame_graphable
         self._frame_graphs: dict[
             int,

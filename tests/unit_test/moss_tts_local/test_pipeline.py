@@ -241,8 +241,14 @@ def test_engine_init_sets_local_decode_cuda_graph_buckets(monkeypatch):
         captured["model_arch_override"] = model_arch_override
 
         class FakeModel:
+            def __init__(self):
+                self.prepared_frame_decode_bs = None
+
             def init_frame_decode_graphs(self, batch_sizes):
                 captured["frame_decode_graph_bs"].append(batch_sizes)
+
+            def prepare_frame_decode_for_capture(self, batch_sizes):
+                self.prepared_frame_decode_bs = list(batch_sizes)
 
             def reset_request(self, request_id):
                 del request_id
@@ -277,9 +283,13 @@ def test_engine_init_sets_local_decode_cuda_graph_buckets(monkeypatch):
         def __init__(self, model_worker, output_proc) -> None:
             captured["model_runner_args"] = (model_worker, output_proc)
 
+        def set_stream_outbox(self, outbox) -> None:
+            captured["stream_outbox"] = outbox
+
     class FakeOmniScheduler:
         def __init__(self, **kwargs) -> None:
             captured["scheduler_kwargs"] = kwargs
+            self.outbox = None
 
     fake_model_runner_module = types.ModuleType(
         "sglang_omni.models.moss_tts_local.model_runner"
@@ -332,32 +342,23 @@ def test_engine_init_sets_local_decode_cuda_graph_buckets(monkeypatch):
         "OpenMOSS-Team/moss-local-test",
         server_args_overrides={
             "cuda_graph_bs": [1, 4],
-            "decode_graph_padding": True,
-            "decode_graph_padding_ratio_threshold": 1.25,
-            "forward_native_decode_enabled": True,
         },
+        forward_native_decode_enabled=True,
     )
 
     default_model, override_model = captured["models"]
     default_graph_bs, override_graph_bs = captured["frame_decode_graph_bs"]
 
-    assert default_model._moss_local_decode_cuda_graph_bs == [1, 2, 4, 8, 16]
-    assert default_model._moss_local_decode_graph_padding is False
-    assert default_model._moss_local_decode_graph_padding_ratio_threshold == 1.15
-    assert default_model._moss_local_forward_native_decode_enabled is False
+    # Native in-forward decode defaults to off; the frame-decode graphs are still
+    # captured so the runner's standalone path stays graphed.
     assert default_model._moss_local_forward_native_decode_active is False
-    assert default_graph_bs is default_model._moss_local_decode_cuda_graph_bs
+    assert default_model.prepared_frame_decode_bs == [1, 2, 4, 8, 16]
     assert default_graph_bs == [1, 2, 4, 8, 16]
 
-    assert override_model._moss_local_decode_cuda_graph_bs == [1, 4]
-    assert override_model._moss_local_decode_graph_padding is True
-    assert override_model._moss_local_decode_graph_padding_ratio_threshold == 1.25
-    assert override_model._moss_local_forward_native_decode_enabled is True
-    assert override_model._moss_local_forward_native_decode_active is False
-    assert override_graph_bs is override_model._moss_local_decode_cuda_graph_bs
+    # Opt-in flag arms the native in-forward decode path.
+    assert override_model._moss_local_forward_native_decode_active is True
+    assert override_model.prepared_frame_decode_bs == [1, 4]
     assert override_graph_bs == [1, 4]
-    assert "decode_graph_padding" not in captured["build_kwargs"][1]
-    assert "forward_native_decode_enabled" not in captured["build_kwargs"][1]
 
     assert captured["graph_inits"] == 2
     assert captured["context_length"] == 8192
@@ -1471,7 +1472,8 @@ def test_lookahead_eligible_routes_eager_batches_to_sync():
 
 def test_async_launch_resolve_matches_sync_collect():
     """post_decode_launch + post_decode_resolve must yield the same published
-    next_token_ids and the same output_rows append as synchronous _collect_frame.
+    next_token_ids and the same output_rows append as synchronous
+    _collect_frame_in_runner.
     The launch hands resolve a device snapshot of the published ids so they
     survive the next step clobbering the aliased output_ids tensor in place; CPU
     stub: eager decode (no CUDA graph).
@@ -1535,7 +1537,7 @@ def test_async_launch_resolve_matches_sync_collect():
     # Synchronous collect.
     rs = _make_runner()
     req_s, res_s, sb_s = _sched_req(), _result(), types.SimpleNamespace()
-    rs._collect_frame(res_s, None, sb_s, [req_s])
+    rs._collect_frame_in_runner(res_s, None, sb_s, [req_s])
 
     # Async launch + resolve (separate runner/pool to avoid cross-overwrite).
     ra = _make_runner()

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import bisect
 from typing import Any
 
 import torch
@@ -88,7 +87,7 @@ class MossTTSLocalModelRunner(ModelRunner):
             is_prefill_only = False
         if bool(is_prefill_only):
             return
-        self._collect_frame_eager(result, forward_batch, schedule_batch, requests)
+        self._collect_frame_in_runner(result, forward_batch, schedule_batch, requests)
 
     def post_decode(
         self,
@@ -100,7 +99,7 @@ class MossTTSLocalModelRunner(ModelRunner):
         if not bool(getattr(self, "_forward_sample_native_decode", False)) or bool(
             getattr(forward_batch, "moss_has_audio_repetition_penalty", False)
         ):
-            self._collect_frame_eager(result, forward_batch, schedule_batch, requests)
+            self._collect_frame_in_runner(result, forward_batch, schedule_batch, requests)
             return
         self._collect_frame_from_forward_sample(result, schedule_batch, requests)
 
@@ -191,40 +190,6 @@ class MossTTSLocalModelRunner(ModelRunner):
             dtype=self.model.dtype,
         )
 
-    def _decode_staging_batch_size(self, raw_batch_size: int) -> int:
-        """Return the model-buffer rows SGLang may read for this decode step.
-
-        SGLang's cuda graph runner receives the raw ForwardBatch, then pads it
-        to the next captured ``cuda_graph_bs`` bucket during replay. The model
-        staging buffers are outside SGLang's GraphInputBuffers, so they must be
-        prefilled up to the same bucket here.
-        """
-        raw_batch_size = int(raw_batch_size)
-        if raw_batch_size <= 0:
-            return 0
-        if not bool(getattr(self.model, "_moss_local_decode_graph_padding", False)):
-            return raw_batch_size
-        buckets = sorted(
-            {
-                int(bs)
-                for bs in getattr(self.model, "_moss_local_decode_cuda_graph_bs", [])
-                if int(bs) > 0
-            }
-        )
-        if not buckets:
-            return raw_batch_size
-        idx = bisect.bisect_left(buckets, raw_batch_size)
-        if idx >= len(buckets):
-            return raw_batch_size
-        staging_batch_size = buckets[idx]
-        try:
-            frame_graph_max_bs = int(self.model.frame_graph_max_bs)
-        except AttributeError:
-            frame_graph_max_bs = max(buckets)
-        if staging_batch_size > frame_graph_max_bs:
-            return raw_batch_size
-        return staging_batch_size
-
     def _prepare_forward_sample_inputs(
         self,
         forward_batch: Any,
@@ -238,23 +203,22 @@ class MossTTSLocalModelRunner(ModelRunner):
             self.model._moss_local_forward_native_decode_active = False
             return
         n_real = len(requests)
-        raw_batch_size = int(getattr(forward_batch, "batch_size", n_real) or n_real)
-        staging_batch_size = self._decode_staging_batch_size(raw_batch_size)
+        batch_size = int(getattr(forward_batch, "batch_size", n_real) or n_real)
         model = self.model
         max_rows = int(model._cg_pool_rows.shape[0])
-        if raw_batch_size < n_real:
+        if batch_size < n_real:
             raise RuntimeError(
-                "MOSS-TTS Local decode graph batch is smaller than the "
-                f"real batch ({raw_batch_size} < {n_real})"
+                "MOSS-TTS Local decode batch is smaller than the "
+                f"real batch ({batch_size} < {n_real})"
             )
-        if forward_batch.input_ids.numel() < raw_batch_size:
+        if forward_batch.input_ids.numel() < batch_size:
             raise RuntimeError(
-                "MOSS-TTS Local decode input_ids must contain " "one row id per request"
+                "MOSS-TTS Local decode input_ids must contain one row id per request"
             )
-        if staging_batch_size > max_rows:
+        if batch_size > max_rows:
             raise RuntimeError(
                 "MOSS-TTS Local decode batch exceeds staging buffers "
-                f"({staging_batch_size} > {max_rows})"
+                f"({batch_size} > {max_rows})"
             )
 
         pool = model._state_pool
@@ -266,50 +230,37 @@ class MossTTSLocalModelRunner(ModelRunner):
         except AttributeError:
             frame_graph_max_bs = 0
         use_forward_native_decode = (
-            bool(getattr(model, "_moss_local_forward_native_decode_enabled", False))
+            getattr(model, "_moss_local_native_decode_enabled", False)
             and not has_audio_repetition_penalty
-            and raw_batch_size <= frame_graph_max_bs
+            and batch_size <= frame_graph_max_bs
         )
         model._moss_local_forward_native_decode_active = use_forward_native_decode
         staged_pool_rows = list(pool_rows)
-        if staging_batch_size > n_real:
-            staged_pool_rows.extend([pool.padding_row] * (staging_batch_size - n_real))
+        if batch_size > n_real:
+            staged_pool_rows.extend([pool.padding_row] * (batch_size - n_real))
         row_t = torch.tensor(
             staged_pool_rows, dtype=torch.long, device=pool.feedback_embeds.device
         )
+        stage_fields = self._DYNAMIC_STAGE_FIELDS
+        if use_forward_native_decode:
+            stage_fields = stage_fields + self._STATIC_STAGE_FIELDS
 
         with torch.no_grad():
-            model._cg_pool_rows[:staging_batch_size].copy_(
+            model._cg_pool_rows[:batch_size].copy_(
                 row_t.to(device=model._cg_pool_rows.device)
             )
-            active_rows_t = model._cg_pool_rows[:staging_batch_size].to(
+            active_rows_t = model._cg_pool_rows[:batch_size].to(
                 device=pool.feedback_embeds.device
             )
-            for dst_name, src_name in self._DYNAMIC_STAGE_FIELDS:
+            for dst_name, src_name in stage_fields:
                 dst = getattr(model, dst_name)
                 src = getattr(pool, src_name)
-                dst[:staging_batch_size].copy_(
+                dst[:batch_size].copy_(
                     src[active_rows_t].to(device=dst.device, dtype=dst.dtype)
-                )
-            static_copy_slots = 0
-            if use_forward_native_decode:
-                static_copy_slots = self._stage_static_fields_for_changed_rows(
-                    model,
-                    pool,
-                    active_rows_t,
-                    staging_batch_size,
                 )
             stats = getattr(model, "_moss_local_decode_stats", None)
             if isinstance(stats, dict):
-                stats["raw_batch_size"] = raw_batch_size
-                stats["staging_batch_size"] = staging_batch_size
-                stats["dynamic_stage_copy_slots"] = (
-                    stats.get("dynamic_stage_copy_slots", 0)
-                    + staging_batch_size * len(self._DYNAMIC_STAGE_FIELDS)
-                )
-                stats["static_stage_copy_slots"] = (
-                    stats.get("static_stage_copy_slots", 0) + static_copy_slots
-                )
+                stats["batch_size"] = batch_size
                 key = (
                     "forward_native_enabled_count"
                     if use_forward_native_decode
@@ -318,11 +269,11 @@ class MossTTSLocalModelRunner(ModelRunner):
                 stats[key] = stats.get(key, 0) + 1
 
         row_ids = torch.arange(
-            raw_batch_size,
+            batch_size,
             dtype=torch.long,
             device=forward_batch.input_ids.device,
         )
-        forward_batch.input_ids[:raw_batch_size].copy_(row_ids)
+        forward_batch.input_ids[:batch_size].copy_(row_ids)
         forward_batch.moss_pool_row_t = row_tensor
         forward_batch.moss_pool_rows = pool_rows
         forward_batch.moss_has_audio_repetition_penalty = has_audio_repetition_penalty
@@ -331,69 +282,6 @@ class MossTTSLocalModelRunner(ModelRunner):
         self._forward_sample_pool_row_t = row_tensor
         self._forward_sample_rids = [sched_req.request_id for sched_req in requests]
         self._forward_sample_native_decode = use_forward_native_decode
-
-    def _stage_static_fields_for_changed_rows(
-        self,
-        model: Any,
-        pool: Any,
-        active_rows_t: torch.Tensor,
-        staging_batch_size: int,
-    ) -> int:
-        if not hasattr(model, "_cg_active_pool_rows_cached"):
-            model._cg_active_pool_rows_cached = torch.full_like(
-                model._cg_pool_rows, -1
-            )
-        if not hasattr(model, "_cg_active_pool_row_versions_cached"):
-            model._cg_active_pool_row_versions_cached = torch.full_like(
-                model._cg_pool_rows, -1
-            )
-        active_rows_for_cache = model._cg_pool_rows[:staging_batch_size]
-        active_versions = pool.params_versions[active_rows_t].to(
-            device=active_rows_for_cache.device,
-            dtype=torch.int64,
-        )
-        cached_rows = model._cg_active_pool_rows_cached[:staging_batch_size]
-        cached_versions = model._cg_active_pool_row_versions_cached[
-            :staging_batch_size
-        ]
-        changed = (cached_rows != active_rows_for_cache) | (
-            cached_versions != active_versions
-        )
-        changed_idx = torch.nonzero(changed, as_tuple=False).flatten()
-        num_changed = int(changed_idx.numel())
-        if num_changed == 0:
-            return 0
-        changed_rows = active_rows_t.index_select(
-            0, changed_idx.to(active_rows_t.device)
-        )
-        for dst_name, src_name in self._STATIC_STAGE_FIELDS:
-            dst = getattr(model, dst_name)
-            src = getattr(pool, src_name)
-            dst.index_copy_(
-                0,
-                changed_idx.to(device=dst.device),
-                src[changed_rows].to(device=dst.device, dtype=dst.dtype),
-            )
-        cached_rows.index_copy_(
-            0,
-            changed_idx.to(device=cached_rows.device),
-            active_rows_for_cache.index_select(0, changed_idx),
-        )
-        cached_versions.index_copy_(
-            0,
-            changed_idx.to(device=cached_versions.device),
-            active_versions.index_select(0, changed_idx),
-        )
-        return num_changed * len(self._STATIC_STAGE_FIELDS)
-
-    def _collect_frame(
-        self,
-        result: Any,
-        forward_batch: Any,
-        schedule_batch: Any,
-        requests: list,
-    ) -> None:
-        self._collect_frame_eager(result, forward_batch, schedule_batch, requests)
 
     def _collect_frame_from_forward_sample(
         self,
@@ -467,7 +355,7 @@ class MossTTSLocalModelRunner(ModelRunner):
             rows=rows.index_select(0, emit_index_t),
         )
 
-    def _collect_frame_eager(
+    def _collect_frame_in_runner(
         self,
         result: Any,
         forward_batch: Any,
@@ -484,7 +372,7 @@ class MossTTSLocalModelRunner(ModelRunner):
         schedule_batch.output_ids = next_token_ids
 
     def _run_frame_decode(self, result: Any, forward_batch: Any, requests: list):
-        """GPU half shared by sync ``_collect_frame`` and async
+        """GPU half shared by sync ``_collect_frame_in_runner`` and async
         ``post_decode_launch``. Returns ``(rows, end_id)`` and does NOT publish
         ``next_token_ids``; the caller does, because the async path keeps a
         private device snapshot of the published ids for resolve to restore.
