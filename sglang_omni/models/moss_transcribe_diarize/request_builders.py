@@ -371,11 +371,7 @@ def make_moss_transcribe_diarize_scheduler_adapters(
                 "asr_latency_s": engine_time_s,
                 "prompt_tokens": len(data.prompt_token_ids or []),
                 "completion_tokens": len(output_ids),
-                "usage": {
-                    "engine_time_s": engine_time_s,
-                    "prompt_tokens": len(data.prompt_token_ids or []),
-                    "completion_tokens": len(output_ids),
-                },
+                "usage": {"engine_time_s": engine_time_s},
                 "finish_reason": data.finish_reason,
                 "weight_version": getattr(data, "weight_version", None),
                 "modality": "text",
