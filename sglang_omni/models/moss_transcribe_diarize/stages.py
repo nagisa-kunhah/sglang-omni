@@ -27,6 +27,10 @@ from sglang_omni.scheduling.sglang_backend import (
     SGLangOutputProcessor,
     build_sglang_server_args,
 )
+from sglang_omni.scheduling.stage_cache import StageOutputCache
+
+MOSS_TD_ENCODER_CACHE_MAX_ENTRIES = 64
+MOSS_TD_ENCODER_CACHE_MAX_BYTES = 4 * 1024**3
 
 # Note (yichi): Budget for long-form input and let the checkpoint window cap it.
 _LONG_FORM_PROMPT_TOKENS = 72000
@@ -57,6 +61,8 @@ def create_sglang_moss_transcribe_diarize_executor(
     context_length: int | None = None,
     mem_fraction_static: float | None = None,
     mm_embedding_cache_size_bytes: int = 0,
+    encoder_cache_max_entries: int = MOSS_TD_ENCODER_CACHE_MAX_ENTRIES,
+    encoder_cache_max_bytes: int = MOSS_TD_ENCODER_CACHE_MAX_BYTES,
     enable_torch_compile: bool = False,
     request_build_max_workers: int = 2,
     request_build_max_pending: int | None = 16,
@@ -115,6 +121,16 @@ def create_sglang_moss_transcribe_diarize_executor(
         model_arch_override="MossTranscribeDiarizeForConditionalGeneration",
     )
 
+    model = model_worker.model_runner.model
+    encoder_cache = None
+    if encoder_cache_max_entries > 0 and encoder_cache_max_bytes > 0:
+        encoder_cache = StageOutputCache(
+            max_size=encoder_cache_max_entries,
+            max_bytes=encoder_cache_max_bytes,
+            cache_device="cpu",
+        )
+    model.set_encoder_output_cache(encoder_cache)
+
     if want_cuda_graph:
         model_worker.model_runner.init_device_graphs()
 
@@ -123,7 +139,7 @@ def create_sglang_moss_transcribe_diarize_executor(
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,
         capture_hidden_layers=None,
-        model=model_worker.model_runner.model,
+        model=model,
     )
     request_builder, result_adapter = make_moss_transcribe_diarize_scheduler_adapters(
         processor=processor,
