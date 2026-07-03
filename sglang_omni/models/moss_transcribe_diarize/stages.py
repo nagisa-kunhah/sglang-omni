@@ -28,12 +28,15 @@ from sglang_omni.scheduling.sglang_backend import (
     build_sglang_server_args,
 )
 
+# Note (yichi): Budget for long-form input and let the checkpoint window cap it.
+_LONG_FORM_PROMPT_TOKENS = 72000
+
 
 def _default_context_length(model_path: str, max_new_tokens: int) -> int:
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     text_config = getattr(config, "text_config", None)
     max_positions = int(getattr(text_config, "max_position_embeddings", 40960))
-    return min(max_positions, max(8192, int(max_new_tokens) + 4096))
+    return min(max_positions, _LONG_FORM_PROMPT_TOKENS + int(max_new_tokens))
 
 
 def _default_max_new_tokens(model_path: str) -> int:
