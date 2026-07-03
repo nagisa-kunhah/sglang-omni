@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
@@ -27,6 +29,7 @@ from sglang.srt.utils import add_prefix
 from sglang_omni.models.moss_transcribe_diarize.hf_config import (
     MossTranscribeDiarizeConfig,
 )
+from sglang_omni.scheduling.stage_cache import StageOutputCache
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +86,10 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             prefix=add_prefix("model.language_model", prefix),
         )
         self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        self.encoder_output_cache: StageOutputCache | None = None
+
+    def set_encoder_output_cache(self, cache: StageOutputCache | None) -> None:
+        self.encoder_output_cache = cache
 
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
@@ -98,6 +105,71 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             batch_size, trimmed_len // merge_size, hidden_size * merge_size
         )
 
+    def _audio_encoder_cache_key(
+        self,
+        item: MultimodalDataItem,
+        input_features: torch.Tensor,
+        audio_feature_lengths: torch.Tensor,
+        audio_chunk_mapping: torch.Tensor,
+    ) -> str | None:
+        item_hash = getattr(item, "hash", None)
+        if item_hash is None:
+            return None
+
+        merge_size = int(self.config.audio_merge_size)
+        shape = tuple(int(dim) for dim in input_features.shape)
+        metadata = (
+            shape,
+            audio_feature_lengths.tolist(),
+            audio_chunk_mapping.tolist(),
+            merge_size,
+        )
+        metadata_digest = hashlib.blake2b(
+            repr(metadata).encode("utf-8"),
+            digest_size=16,
+        ).hexdigest()
+        return f"moss-td-audio:{item_hash}:{shape}:{merge_size}:{metadata_digest}"
+
+    def _to_encoder_cache_device(
+        self,
+        cached: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        adaptor_param = next(self.vq_adaptor.parameters())
+        return [
+            tensor.to(device=adaptor_param.device, dtype=adaptor_param.dtype)
+            for tensor in cached
+        ]
+
+    @staticmethod
+    def _encoder_cache_trace_enabled() -> bool:
+        value = os.getenv("SGLANG_OMNI_TRACE_ENCODER_CACHE", "")
+        return value.lower() not in ("", "0", "false", "no")
+
+    def _trace_encoder_cache(
+        self,
+        action: str,
+        cache_key: str | None,
+        *,
+        detail: str | None = None,
+    ) -> None:
+        if not self._encoder_cache_trace_enabled():
+            return
+        key = "-"
+        if cache_key:
+            key = (
+                cache_key
+                if len(cache_key) <= 32
+                else f"{cache_key[:16]}...{cache_key[-8:]}"
+            )
+        parts = [
+            "stage=moss_transcribe_diarize",
+            f"action={action}",
+            f"key={key}",
+        ]
+        if detail:
+            parts.append(detail)
+        logger.info("encoder_cache %s", " ".join(parts))
+
     def _encode_one_audio_item(
         self,
         item: MultimodalDataItem,
@@ -108,36 +180,49 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
                 "MOSS-Transcribe-Diarize audio item is missing input_features."
             )
 
-        device = next(self.whisper_encoder.parameters()).device
-        encoder_dtype = next(self.whisper_encoder.parameters()).dtype
-        input_features = item.feature.to(device=device, dtype=encoder_dtype)
-
         audio_feature_lengths = getattr(item, "audio_feature_lengths", None)
         if audio_feature_lengths is None:
             raise ValueError(
                 "MOSS-Transcribe-Diarize audio item is missing audio_feature_lengths."
             )
         audio_feature_lengths = audio_feature_lengths.to(device="cpu", dtype=torch.long)
-        if audio_feature_lengths.numel() != input_features.shape[0]:
+        if audio_feature_lengths.numel() != item.feature.shape[0]:
             raise ValueError(
                 "audio_feature_lengths must contain one length per input_features "
                 f"chunk: got {audio_feature_lengths.numel()} lengths for "
-                f"{input_features.shape[0]} chunks."
+                f"{item.feature.shape[0]} chunks."
             )
 
         audio_chunk_mapping = getattr(item, "audio_chunk_mapping", None)
         if audio_chunk_mapping is None:
             audio_chunk_mapping = torch.zeros(
-                input_features.shape[0], dtype=torch.long, device="cpu"
+                item.feature.shape[0], dtype=torch.long, device="cpu"
             )
         else:
             audio_chunk_mapping = audio_chunk_mapping.to(device="cpu", dtype=torch.long)
-        if audio_chunk_mapping.numel() != input_features.shape[0]:
+        if audio_chunk_mapping.numel() != item.feature.shape[0]:
             raise ValueError(
                 "audio_chunk_mapping must contain one sample index per input_features "
                 f"chunk: got {audio_chunk_mapping.numel()} indices for "
-                f"{input_features.shape[0]} chunks."
+                f"{item.feature.shape[0]} chunks."
             )
+
+        cache_key = self._audio_encoder_cache_key(
+            item,
+            item.feature,
+            audio_feature_lengths,
+            audio_chunk_mapping,
+        )
+        if self.encoder_output_cache is not None and cache_key is not None:
+            cached = self.encoder_output_cache.get(cache_key)
+            if cached is not None:
+                self._trace_encoder_cache("hit", cache_key)
+                return self._to_encoder_cache_device(cached)
+            self._trace_encoder_cache("miss", cache_key)
+
+        device = next(self.whisper_encoder.parameters()).device
+        encoder_dtype = next(self.whisper_encoder.parameters()).dtype
+        input_features = item.feature.to(device=device, dtype=encoder_dtype)
 
         encoder_len = (input_features.shape[-1] - 1) // 2 + 1
         encoder_position_ids = torch.arange(
@@ -174,6 +259,9 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             feat = torch.cat(parts, dim=1).to(dtype=adaptor_dtype)
             merged = self.time_merge(feat)
             adapted.append(self.vq_adaptor(merged).squeeze(0))
+        if self.encoder_output_cache is not None and cache_key is not None:
+            self.encoder_output_cache.put(cache_key, adapted)
+            self._trace_encoder_cache("store", cache_key)
         return adapted
 
     def get_audio_feature(
