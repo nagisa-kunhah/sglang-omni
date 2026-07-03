@@ -139,7 +139,7 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
                 f"{input_features.shape[0]} chunks."
             )
 
-        encoder_len = input_features.shape[-1] // 2
+        encoder_len = (input_features.shape[-1] - 1) // 2 + 1
         encoder_position_ids = torch.arange(
             encoder_len,
             device=input_features.device,
