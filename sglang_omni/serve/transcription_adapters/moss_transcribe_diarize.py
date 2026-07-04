@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """verbose_json adapter for MOSS-Transcribe-Diarize.
 
-The model emits ``[start][S01] text [end]`` segments (speaker labels +
-timestamps). This adapter parses that markup into OpenAI ``verbose_json``
+The model emits [start][S01] text [end] segments (speaker labels +
+timestamps). This adapter parses that markup into OpenAI verbose_json
 segments. The segment regex is ported from the upstream SGLang adapter.
 """
 

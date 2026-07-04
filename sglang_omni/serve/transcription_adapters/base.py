@@ -85,8 +85,8 @@ def register_transcription_adapter(
     """Class decorator registering a TranscriptionAdapter under key.
 
     key is matched as a substring against the model's HF architectures at
-    resolve time (e.g. "MossTranscribeDiarize" matches
-    "MossTranscribeDiarizeForConditionalGeneration").
+    resolve time (e.g. MossTranscribeDiarize matches
+    MossTranscribeDiarizeForConditionalGeneration).
     """
 
     def decorator(cls: type[TranscriptionAdapter]) -> type[TranscriptionAdapter]:
