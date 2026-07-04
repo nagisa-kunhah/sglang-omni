@@ -291,7 +291,7 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             else:
-                logger.debug("Skipping weight: %s -> %s", original_name, name)
+                logger.debug(f"Skipping weight: {original_name} -> {name}")
 
         for name, loaded_weight in weights:
             load_one(name, loaded_weight)

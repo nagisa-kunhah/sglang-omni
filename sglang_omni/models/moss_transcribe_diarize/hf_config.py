@@ -59,7 +59,7 @@ class MossTranscribeDiarizeConfig(PretrainedConfig):
             audio_config = self.sub_configs["audio_config"](**audio_config)
 
         text_config.tie_word_embeddings = tie_word_embeddings
-        if not getattr(text_config, "layer_types", None):
+        if not text_config.layer_types:
             text_config.layer_types = ["full_attention"] * text_config.num_hidden_layers
 
         self.text_config = text_config
@@ -70,9 +70,6 @@ class MossTranscribeDiarizeConfig(PretrainedConfig):
             adaptor_input_dim or audio_config.d_model * audio_merge_size
         )
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
-
-    def get_text_config(self, decoder=False) -> PretrainedConfig:
-        return self.text_config
 
 
 AutoConfig.register(

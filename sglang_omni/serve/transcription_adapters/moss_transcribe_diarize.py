@@ -36,7 +36,6 @@ class MossTranscribeDiarizeAdapter(TranscriptionAdapter):
 
     def build_verbose_response(
         self,
-        *,
         text: str,
         language: str | None,
         audio_duration_s: float,

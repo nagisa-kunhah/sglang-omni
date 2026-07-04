@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 import numpy as np
 import torch
+import torchaudio
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -32,6 +33,10 @@ _AUDIO_PAD = "<|audio_pad|>"
 _AUDIO_START = "<|audio_start|>"
 _AUDIO_END = "<|audio_end|>"
 _SPECIAL_TOKEN_RE = re.compile(r"<\|(?:im_start|im_end|endoftext)\|>")
+# MOSS-Transcribe-Diarize is an audio LLM: a Qwen3 text decoder over Whisper
+# audio embeddings, trained on a fixed transcribe+diarize instruction with the
+# timestamped/speaker-labelled transcript as the target output. This is the
+# default instruction used when a request does not supply its own prompt.
 DEFAULT_TRANSCRIBE_DIARIZE_PROMPT = (
     "请将音频转写为文本，每一段需以起始时间戳和说话人编号"
     "（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，"
@@ -52,7 +57,8 @@ def _only_audio(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         if len(value) != 1:
             raise ValueError(
-                "MOSS-Transcribe-Diarize supports exactly one audio per request"
+                "MOSS-Transcribe-Diarize supports exactly one audio per request, "
+                f"got {len(value)} items"
             )
         return value[0]
     return value
@@ -104,8 +110,6 @@ def _decode_data_uri(value: str) -> bytes | None:
 
 
 def load_audio(source: Any) -> np.ndarray:
-    import torchaudio
-
     if isinstance(source, dict):
         if source.get("data") is not None:
             source = source["data"]
@@ -144,8 +148,7 @@ def load_audio(source: Any) -> np.ndarray:
         sample_rate = _SAMPLE_RATE
     else:
         raise ValueError(
-            "Unsupported MOSS-Transcribe-Diarize audio input: "
-            f"{type(source).__name__}"
+            f"Unsupported MOSS-Transcribe-Diarize audio input: {type(source).__name__}"
         )
 
     if audio.ndim == 1:
@@ -243,7 +246,6 @@ def _contiguous_offsets(input_ids: list[int], token_id: int) -> list[tuple[int, 
 
 
 def make_moss_transcribe_diarize_scheduler_adapters(
-    *,
     processor: Any,
     tokenizer: Any,
     max_new_tokens: int,

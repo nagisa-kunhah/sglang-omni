@@ -1,21 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Model-specific transcription output adapters.
 
-Ported from the upstream SGLang ``transcription_adapters`` pattern: subclass
-:class:`TranscriptionAdapter`, decorate with
-``@register_transcription_adapter("Key")``, and the ``/v1/audio/transcriptions``
-handler resolves the right adapter by matching *Key* as a substring against the
-served model's HF ``architectures``.
+Ported from the upstream SGLang transcription_adapters pattern: subclass
+TranscriptionAdapter, decorate with register_transcription_adapter("Key"), and
+the /v1/audio/transcriptions handler resolves the right adapter by matching Key
+as a substring against the served model's HF architectures.
 
 Only the pieces the omni HTTP layer needs are kept: markup post-processing and
-``verbose_json`` segment building. Sampling / prompt construction already live
-in each model's pipeline (``stages.py`` / ``request_builders.py``), so they are
+verbose_json segment building. Sampling / prompt construction already live in
+each model's pipeline (stages.py / request_builders.py), so they are
 intentionally not part of this interface.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 
 from sglang_omni.serve.protocol import (
     TranscriptionSegment,
@@ -37,12 +37,11 @@ class TranscriptionAdapter(ABC):
     @abstractmethod
     def build_verbose_response(
         self,
-        *,
         text: str,
         language: str | None,
         audio_duration_s: float,
     ) -> TranscriptionVerboseResponse:
-        """Build a ``verbose_json`` response with segments / timestamps."""
+        """Build a verbose_json response with segments / timestamps."""
 
 
 class DefaultTranscriptionAdapter(TranscriptionAdapter):
@@ -50,7 +49,6 @@ class DefaultTranscriptionAdapter(TranscriptionAdapter):
 
     def build_verbose_response(
         self,
-        *,
         text: str,
         language: str | None,
         audio_duration_s: float,
@@ -81,12 +79,14 @@ _DEFAULT_ADAPTER_KEY = "__default__"
 _ADAPTER_REGISTRY[_DEFAULT_ADAPTER_KEY] = DefaultTranscriptionAdapter
 
 
-def register_transcription_adapter(key: str):
-    """Class decorator registering a :class:`TranscriptionAdapter` under *key*.
+def register_transcription_adapter(
+    key: str,
+) -> Callable[[type[TranscriptionAdapter]], type[TranscriptionAdapter]]:
+    """Class decorator registering a TranscriptionAdapter under key.
 
-    *key* is matched as a substring against the model's HF ``architectures``
-    at resolve time (e.g. ``"MossTranscribeDiarize"`` matches
-    ``"MossTranscribeDiarizeForConditionalGeneration"``).
+    key is matched as a substring against the model's HF architectures at
+    resolve time (e.g. "MossTranscribeDiarize" matches
+    "MossTranscribeDiarizeForConditionalGeneration").
     """
 
     def decorator(cls: type[TranscriptionAdapter]) -> type[TranscriptionAdapter]:
