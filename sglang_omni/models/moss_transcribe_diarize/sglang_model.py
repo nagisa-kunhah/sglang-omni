@@ -83,6 +83,8 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             prefix=add_prefix("model.language_model", prefix),
         )
         self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        self._compiled_whisper_encoder = None
+        self._compiled_vq_adaptor = None
 
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
@@ -97,6 +99,50 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         return features[:, :trimmed_len, :].reshape(
             batch_size, trimmed_len // merge_size, hidden_size * merge_size
         )
+
+    def compile_audio_encoder(
+        self,
+        *,
+        mode: str,
+        dynamic: bool = True,
+        compile_adaptor: bool = False,
+    ) -> None:
+        """Compile tensor-only audio encoder hot paths.
+
+        Keep the original modules installed on the model so weight loading,
+        state dicts, and debugging still see the eager module tree. The compiled
+        callables are intentionally stored outside ``nn.Module`` registration.
+        """
+        from sglang.srt.model_executor.cuda_graph_runner import set_torch_compile_config
+
+        set_torch_compile_config()
+        logger.info(
+            "Compiling MOSS-TD WhisperEncoder (mode=%s, dynamic=%s)",
+            mode,
+            dynamic,
+        )
+        self.__dict__["_compiled_whisper_encoder"] = torch.compile(
+            self.whisper_encoder,
+            mode=mode,
+            dynamic=dynamic,
+        )
+        if compile_adaptor:
+            logger.info(
+                "Compiling MOSS-TD VQAdaptor (mode=%s, dynamic=%s)",
+                mode,
+                dynamic,
+            )
+            self.__dict__["_compiled_vq_adaptor"] = torch.compile(
+                self.vq_adaptor,
+                mode=mode,
+                dynamic=dynamic,
+            )
+
+    def _audio_encoder_callable(self):
+        return self.__dict__.get("_compiled_whisper_encoder") or self.whisper_encoder
+
+    def _vq_adaptor_callable(self):
+        return self.__dict__.get("_compiled_vq_adaptor") or self.vq_adaptor
 
     def get_audio_feature(
         self,
@@ -164,7 +210,7 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         encoder_position_ids = torch.arange(
             encoder_len, device=device, dtype=torch.long
         )
-        features = self.whisper_encoder(
+        features = self._audio_encoder_callable()(
             batched_features, encoder_position_ids, forward_batch
         )
 
@@ -178,7 +224,7 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             ).squeeze(0)
             for ids in audio_spans
         ]
-        return self.vq_adaptor(torch.cat(merged, dim=0))
+        return self._vq_adaptor_callable()(torch.cat(merged, dim=0))
 
     def forward(
         self,

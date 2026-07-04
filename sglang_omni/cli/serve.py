@@ -29,6 +29,18 @@ _ASYNC_DECODE_FACTORIES = frozenset(
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
 )
+_MOSS_TD_ASR_ENCODER_COMPILE_FACTORIES = frozenset(
+    {
+        (
+            "sglang_omni.models.moss_transcribe_diarize.stages."
+            "create_sglang_moss_transcribe_diarize_executor"
+        ),
+        (
+            "sglang_omni.models.moss_transcribe_diarize.stages."
+            "create_moss_transcribe_diarize_executor"
+        ),
+    }
+)
 
 
 def launch_server(*args: object, **kwargs: object) -> object:
@@ -796,6 +808,7 @@ def _apply_stage_factory_args_override(
     updates: dict[str, object],
     reason: str,
     supported_factories: frozenset[str] | None = None,
+    supported_factories_description: str = "Higgs TTS and MOSS-TTS-Local",
     flag_name: str | None = None,
 ) -> None:
     matching_stages = _find_matching_stages(
@@ -807,9 +820,9 @@ def _apply_stage_factory_args_override(
         if supported_factories is not None and stage.factory not in supported_factories:
             display_flag = flag_name or reason
             raise typer.BadParameter(
-                f"{display_flag} currently supports only Higgs TTS and "
-                f"MOSS-TTS-Local; stage {stage.name!r} uses factory "
-                f"{stage.factory!r}"
+                f"{display_flag} currently supports only "
+                f"{supported_factories_description}; stage {stage.name!r} "
+                f"uses factory {stage.factory!r}"
             )
         factory_args = dict(stage.factory_args or {})
         factory_args.update(updates)
@@ -888,6 +901,36 @@ def apply_torch_compile_cli_overrides(
             mode=talker_mode,
             max_bs=talker_torch_compile_max_bs,
         )
+    return pipeline_config
+
+
+def apply_asr_encoder_torch_compile_cli_overrides(
+    pipeline_config: PipelineConfig,
+    *,
+    asr_encoder_torch_compile: str,
+    asr_encoder_torch_compile_mode: str | None,
+) -> PipelineConfig:
+    mode = _normalize_stage_toggle_mode(
+        "asr_encoder_torch_compile",
+        asr_encoder_torch_compile,
+    )
+    updates: dict[str, object] = {}
+    if mode != "default":
+        updates["encoder_torch_compile"] = mode == "on"
+    if asr_encoder_torch_compile_mode is not None:
+        updates["encoder_torch_compile_mode"] = asr_encoder_torch_compile_mode
+    if not updates:
+        return pipeline_config
+
+    _apply_stage_factory_args_override(
+        pipeline_config,
+        stage_name="asr",
+        updates=updates,
+        reason="ASR encoder torch.compile override",
+        supported_factories=_MOSS_TD_ASR_ENCODER_COMPILE_FACTORIES,
+        supported_factories_description="MOSS-Transcribe-Diarize ASR",
+        flag_name="--asr-encoder-torch-compile",
+    )
     return pipeline_config
 
 
@@ -1130,6 +1173,28 @@ def serve(
             help="Override torch_compile_max_bs for supported SGLang talker stage.",
         ),
     ] = None,
+    asr_encoder_torch_compile: Annotated[
+        str,
+        typer.Option(
+            "--asr-encoder-torch-compile",
+            "--asr_encoder_torch_compile",
+            help=(
+                "torch.compile mode for the MOSS-Transcribe-Diarize ASR "
+                "encoder: default|on|off."
+            ),
+        ),
+    ] = "default",
+    asr_encoder_torch_compile_mode: Annotated[
+        str | None,
+        typer.Option(
+            "--asr-encoder-torch-compile-mode",
+            "--asr_encoder_torch_compile_mode",
+            help=(
+                "Torch compile mode for the MOSS-Transcribe-Diarize ASR "
+                "encoder, e.g. max-autotune-no-cudagraphs."
+            ),
+        ),
+    ] = None,
     enable_realtime: Annotated[
         bool,
         typer.Option(
@@ -1258,6 +1323,11 @@ def serve(
         talker_torch_compile=talker_torch_compile,
         thinker_torch_compile_max_bs=thinker_torch_compile_max_bs,
         talker_torch_compile_max_bs=talker_torch_compile_max_bs,
+    )
+    merged_config = apply_asr_encoder_torch_compile_cli_overrides(
+        merged_config,
+        asr_encoder_torch_compile=asr_encoder_torch_compile,
+        asr_encoder_torch_compile_mode=asr_encoder_torch_compile_mode,
     )
     merged_config = apply_decode_mode_cli_overrides(
         merged_config,

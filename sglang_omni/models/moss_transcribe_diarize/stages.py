@@ -5,8 +5,12 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+import logging
+import os
+from types import SimpleNamespace
 from typing import Any
 
+import torch
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from transformers import AutoConfig, AutoProcessor, GenerationConfig
 
@@ -29,6 +33,8 @@ from sglang_omni.scheduling.sglang_backend import (
     SGLangOutputProcessor,
     build_sglang_server_args,
 )
+
+logger = logging.getLogger(__name__)
 
 # Note (yichi): Budget for long-form input and let the checkpoint window cap it.
 _LONG_FORM_PROMPT_TOKENS = 72000
@@ -83,6 +89,69 @@ def _default_max_new_tokens(model_path: str) -> int:
     return int(getattr(generation_config, "max_new_tokens", None) or 5120)
 
 
+def _resolve_encoder_torch_compile_mode(mode: str | None) -> str:
+    return mode or os.environ.get(
+        "SGLANG_TORCH_COMPILE_MODE",
+        "max-autotune-no-cudagraphs",
+    )
+
+
+def _torch_dtype_from_name(dtype: str | torch.dtype) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    normalized = str(dtype).replace("torch.", "").lower()
+    if normalized in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    if normalized in {"float16", "half", "fp16"}:
+        return torch.float16
+    if normalized in {"float32", "float", "fp32"}:
+        return torch.float32
+    return torch.bfloat16
+
+
+def _warmup_moss_td_encoder_compile(
+    model: Any,
+    *,
+    device: str,
+    dtype: str | torch.dtype,
+) -> None:
+    compiled_encoder = getattr(model, "_compiled_whisper_encoder", None)
+    if compiled_encoder is None:
+        return
+
+    try:
+        first_param = next(model.whisper_encoder.parameters())
+        warmup_device = first_param.device
+        warmup_dtype = first_param.dtype
+    except (AttributeError, StopIteration):
+        warmup_device = torch.device(device)
+        warmup_dtype = _torch_dtype_from_name(dtype)
+
+    audio_config = model.config.audio_config
+    num_mel_bins = int(getattr(audio_config, "num_mel_bins", 80))
+    max_source_positions = int(getattr(audio_config, "max_source_positions", 1500))
+    num_frames = max(2, max_source_positions * 2)
+    input_features = torch.zeros(
+        (1, num_mel_bins, num_frames),
+        device=warmup_device,
+        dtype=warmup_dtype,
+    )
+    encoder_len = (input_features.shape[-1] - 1) // 2 + 1
+    encoder_position_ids = torch.arange(
+        encoder_len,
+        device=input_features.device,
+        dtype=torch.long,
+    )
+    fake_forward_batch = SimpleNamespace()
+
+    with torch.inference_mode():
+        compiled_encoder(input_features, encoder_position_ids, fake_forward_batch)
+    logger.info(
+        "Warmed up MOSS-TD encoder compile with input_features shape=%s",
+        tuple(input_features.shape),
+    )
+
+
 def create_sglang_moss_transcribe_diarize_executor(
     model_path: str,
     *,
@@ -94,6 +163,11 @@ def create_sglang_moss_transcribe_diarize_executor(
     mem_fraction_static: float | None = 0.80,
     mm_embedding_cache_size_bytes: int = 0,
     enable_torch_compile: bool = False,
+    encoder_torch_compile: bool = False,
+    encoder_torch_compile_mode: str | None = None,
+    encoder_torch_compile_dynamic: bool = True,
+    encoder_torch_compile_warmup: bool = True,
+    encoder_torch_compile_adaptor: bool = False,
     request_build_max_workers: int = 2,
     request_build_max_pending: int | None = 16,
     server_args_overrides: dict[str, Any] | None = None,
@@ -151,6 +225,17 @@ def create_sglang_moss_transcribe_diarize_executor(
         gpu_id,
         model_arch_override="MossTranscribeDiarizeForConditionalGeneration",
     )
+
+    if encoder_torch_compile:
+        model = model_worker.model_runner.model
+        compile_mode = _resolve_encoder_torch_compile_mode(encoder_torch_compile_mode)
+        model.compile_audio_encoder(
+            mode=compile_mode,
+            dynamic=encoder_torch_compile_dynamic,
+            compile_adaptor=encoder_torch_compile_adaptor,
+        )
+        if encoder_torch_compile_warmup:
+            _warmup_moss_td_encoder_compile(model, device=device, dtype=dtype)
 
     if want_cuda_graph:
         model_worker.model_runner.init_device_graphs()
