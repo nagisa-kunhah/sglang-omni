@@ -173,17 +173,25 @@ def test_compile_audio_encoder_optionally_compiles_adaptor_and_encode_uses_compi
     encoder_calls: list[torch.Tensor] = []
     adaptor_calls: list[torch.Tensor] = []
 
-    def compiled_encoder(input_features, encoder_position_ids, forward_batch):
-        del encoder_position_ids, forward_batch
-        encoder_calls.append(input_features)
-        return torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
+    class CompiledEncoder:
+        def __bool__(self):
+            raise TypeError("compiled encoder should not be truth-tested")
 
-    def compiled_adaptor(features):
-        adaptor_calls.append(features)
-        return torch.ones((features.shape[0], 5), dtype=torch.float32)
+        def __call__(self, input_features, encoder_position_ids, forward_batch):
+            del encoder_position_ids, forward_batch
+            encoder_calls.append(input_features)
+            return torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
 
-    model._compiled_whisper_encoder = compiled_encoder
-    model._compiled_vq_adaptor = compiled_adaptor
+    class CompiledAdaptor:
+        def __bool__(self):
+            raise TypeError("compiled adaptor should not be truth-tested")
+
+        def __call__(self, features):
+            adaptor_calls.append(features)
+            return torch.ones((features.shape[0], 5), dtype=torch.float32)
+
+    model._compiled_whisper_encoder = CompiledEncoder()
+    model._compiled_vq_adaptor = CompiledAdaptor()
     model.config = SimpleNamespace(audio_merge_size=2)
     model_class = sglang_model.MossTranscribeDiarizeForConditionalGeneration
     model.time_merge = lambda features: model_class.time_merge(
@@ -360,6 +368,22 @@ def test_moss_td_stage_applies_encoder_compile_without_enabling_sglang_compile(
     ]
     assert init_graph_calls == [True]
     assert scheduler.server_args.enable_torch_compile is False
+
+
+def test_moss_td_stage_encoder_compile_defaults_are_e2e_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stages = _import_stages(monkeypatch)
+    monkeypatch.delenv("SGLANG_TORCH_COMPILE_MODE", raising=False)
+
+    assert stages._resolve_encoder_torch_compile_mode(None) == (
+        "max-autotune-no-cudagraphs"
+    )
+    assert stages._resolve_encoder_torch_compile_mode("reduce-overhead") == (
+        "reduce-overhead"
+    )
+    defaults = stages.create_sglang_moss_transcribe_diarize_executor.__kwdefaults__
+    assert defaults["encoder_torch_compile_dynamic"] is False
 
 
 def test_moss_td_stage_skips_encoder_compile_by_default(

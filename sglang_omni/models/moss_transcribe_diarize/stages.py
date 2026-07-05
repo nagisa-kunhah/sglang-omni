@@ -165,7 +165,7 @@ def create_sglang_moss_transcribe_diarize_executor(
     enable_torch_compile: bool = False,
     encoder_torch_compile: bool = False,
     encoder_torch_compile_mode: str | None = None,
-    encoder_torch_compile_dynamic: bool = True,
+    encoder_torch_compile_dynamic: bool = False,
     encoder_torch_compile_warmup: bool = True,
     encoder_torch_compile_adaptor: bool = False,
     request_build_max_workers: int = 2,

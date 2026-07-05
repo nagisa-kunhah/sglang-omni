@@ -139,10 +139,12 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             )
 
     def _audio_encoder_callable(self):
-        return self.__dict__.get("_compiled_whisper_encoder") or self.whisper_encoder
+        compiled = self.__dict__.get("_compiled_whisper_encoder")
+        return compiled if compiled is not None else self.whisper_encoder
 
     def _vq_adaptor_callable(self):
-        return self.__dict__.get("_compiled_vq_adaptor") or self.vq_adaptor
+        compiled = self.__dict__.get("_compiled_vq_adaptor")
+        return compiled if compiled is not None else self.vq_adaptor
 
     def get_audio_feature(
         self,
