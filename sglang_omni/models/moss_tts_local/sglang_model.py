@@ -38,6 +38,7 @@ from sglang_omni.models.moss_tts_local.payload_types import (
     moss_tts_local_special_token_defaults,
 )
 from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeStatePool
+from sglang_omni.utils.compiled_stage import CompiledStage
 
 logger = logging.getLogger(__name__)
 
@@ -368,18 +369,21 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         set_torch_compile_config()
         self._frame_compile_configured = True
 
-    def _ensure_frame_sampler_compile(self) -> None:
+    def _ensure_frame_sampler_compile(self, *, enabled: bool = True) -> None:
         if self._compiled_frame_sampler is None:
             compile_mode = os.environ.get(
                 "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
             )
-            self._ensure_frame_compile_config()
-            self._compiled_frame_sampler = torch.compile(
+            if enabled:
+                self._ensure_frame_compile_config()
+            self._compiled_frame_sampler = CompiledStage(
+                "moss_tts_local.frame_sampler",
                 sample_seeded_branchless,
-                mode=compile_mode,
+                enabled=enabled,
+                compile_kwargs={"mode": compile_mode},
+                bucket_fn=lambda logits, *args, **kwargs: int(logits.shape[0]),
             )
             self._sample_seeded_branchless = self._compiled_frame_sampler
-            logger.info(f"Compiled MOSS-TTS Local frame sampler (mode={compile_mode})")
 
     @torch.no_grad()
     def _decode_frame_graphable(
@@ -448,7 +452,12 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         return stop_choice, torch.stack(codes, dim=-1), feedback
 
     @torch.no_grad()
-    def init_frame_decode_graphs(self, batch_sizes: list[int]) -> None:
+    def init_frame_decode_graphs(
+        self,
+        batch_sizes: list[int],
+        *,
+        compile_frame_sampler: bool = True,
+    ) -> None:
         """Capture the per-frame local decode (1 + n_vq micro-steps plus all
         13 seeded sampling passes) into one CUDA graph per batch-size bucket.
 
@@ -468,7 +477,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             max(max(buckets), max_eager_bs), device, self.dtype
         )
         self.local_transformer.freeze_kv_cache()
-        self._ensure_frame_sampler_compile()
+        self._ensure_frame_sampler_compile(enabled=compile_frame_sampler)
         frame_decode = self._decode_frame_graphable
         self._frame_graphs: dict[
             int,
