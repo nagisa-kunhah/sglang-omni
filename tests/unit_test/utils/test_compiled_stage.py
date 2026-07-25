@@ -11,21 +11,6 @@ import torch
 from sglang_omni.utils.compiled_stage import CompiledStage, CompileWarmupCase
 
 
-def test_disabled_compiled_stage_never_calls_compiler() -> None:
-    compiler_calls = []
-
-    stage = CompiledStage(
-        "disabled",
-        lambda value: value + 1,
-        enabled=False,
-        compile_fn=lambda fn, **kwargs: compiler_calls.append((fn, kwargs)),
-    )
-
-    assert stage(2) == 3
-    assert compiler_calls == []
-    assert stage.stats().enabled is False
-
-
 def test_compile_setup_failure_uses_eager(caplog) -> None:
     def fail_compile(_fn, **_kwargs):
         raise RuntimeError("compiler unavailable")

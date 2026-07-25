@@ -369,17 +369,15 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         set_torch_compile_config()
         self._frame_compile_configured = True
 
-    def _ensure_frame_sampler_compile(self, *, enabled: bool = True) -> None:
+    def _ensure_frame_sampler_compile(self) -> None:
         if self._compiled_frame_sampler is None:
             compile_mode = os.environ.get(
                 "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
             )
-            if enabled:
-                self._ensure_frame_compile_config()
+            self._ensure_frame_compile_config()
             self._compiled_frame_sampler = CompiledStage(
                 "moss_tts_local.frame_sampler",
                 sample_seeded_branchless,
-                enabled=enabled,
                 compile_kwargs={"mode": compile_mode},
                 bucket_fn=lambda logits, *args, **kwargs: int(logits.shape[0]),
             )
@@ -477,7 +475,8 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             max(max(buckets), max_eager_bs), device, self.dtype
         )
         self.local_transformer.freeze_kv_cache()
-        self._ensure_frame_sampler_compile(enabled=compile_frame_sampler)
+        if compile_frame_sampler:
+            self._ensure_frame_sampler_compile()
         frame_decode = self._decode_frame_graphable
         self._frame_graphs: dict[
             int,

@@ -428,6 +428,13 @@ def test_higgs_audio_encoder_uses_reference_code_cache(monkeypatch) -> None:
     fake_codec = FakeCodec()
     monkeypatch.setattr(stages, "HiggsTokenizerAdapter", FakeAdapter)
     monkeypatch.setattr(stages, "get_or_load_codec", lambda *args, **kwargs: fake_codec)
+    monkeypatch.setattr(
+        stages,
+        "CompiledStage",
+        lambda *args, **kwargs: pytest.fail(
+            "compile-disabled encoder must keep the eager callable"
+        ),
+    )
 
     scheduler = stages.create_audio_encoder_executor(
         "ckpt",

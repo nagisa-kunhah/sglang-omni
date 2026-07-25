@@ -370,35 +370,37 @@ def create_audio_encoder_executor(
 
     codec = get_or_load_codec(checkpoint_dir, device, dtype)
     acoustic_encoder = codec.model.acoustic_encoder
-    encoder_compile = CompiledStage(
-        "higgs_tts.audio_encoder",
-        acoustic_encoder.forward,
-        enabled=compile_encoder,
-        compile_kwargs={"mode": "default", "dynamic": True},
-        bucket_fn=lambda waveform, *args, **kwargs: tuple(waveform.shape),
-    )
-    acoustic_encoder.forward = encoder_compile
-    parameter = next(acoustic_encoder.parameters(), None)
-    warmup_device = parameter.device if parameter is not None else torch.device("cpu")
-    warmup_dtype = parameter.dtype if parameter is not None else torch.float32
-    encoder_compile.warmup(
-        [
-            CompileWarmupCase(
-                "one-second-reference",
-                args=(
-                    torch.zeros(
-                        1,
-                        1,
-                        codec.SAMPLE_RATE,
-                        device=warmup_device,
-                        dtype=warmup_dtype,
+    if compile_encoder:
+        encoder_compile = CompiledStage(
+            "higgs_tts.audio_encoder",
+            acoustic_encoder.forward,
+            compile_kwargs={"mode": "default", "dynamic": True},
+            bucket_fn=lambda waveform, *args, **kwargs: tuple(waveform.shape),
+        )
+        acoustic_encoder.forward = encoder_compile
+        parameter = next(acoustic_encoder.parameters(), None)
+        warmup_device = (
+            parameter.device if parameter is not None else torch.device("cpu")
+        )
+        warmup_dtype = parameter.dtype if parameter is not None else torch.float32
+        encoder_compile.warmup(
+            [
+                CompileWarmupCase(
+                    "one-second-reference",
+                    args=(
+                        torch.zeros(
+                            1,
+                            1,
+                            codec.SAMPLE_RATE,
+                            device=warmup_device,
+                            dtype=warmup_dtype,
+                        ),
                     ),
-                ),
-                bucket=(1, 1, codec.SAMPLE_RATE),
-            )
-        ]
-    )
-    codec._compiled_audio_encoder = encoder_compile
+                    bucket=(1, 1, codec.SAMPLE_RATE),
+                )
+            ]
+        )
+        codec._compiled_audio_encoder = encoder_compile
     reference_service = ReferenceEncodeService(
         _HiggsReferenceEncodeHook(
             codec,

@@ -35,7 +35,6 @@ class CompileWarmupCase:
 class CompiledStageStats:
     """Immutable snapshot of compile and fallback counters."""
 
-    enabled: bool
     compilation_count: int
     recompilation_count: int
     compile_time_s: float
@@ -65,7 +64,6 @@ class CompiledStage:
         name: str,
         eager: Callable[..., Any],
         *,
-        enabled: bool = True,
         compile_kwargs: Mapping[str, Any] | None = None,
         bucket_fn: Callable[..., Hashable | None] | None = None,
         restrict_to_warmed_buckets: bool = False,
@@ -73,7 +71,6 @@ class CompiledStage:
     ) -> None:
         self.name = name
         self.eager = eager
-        self.enabled = bool(enabled)
         self.bucket_fn = bucket_fn
         self.restrict_to_warmed_buckets = bool(restrict_to_warmed_buckets)
         self._compiled: Callable[..., Any] | None = None
@@ -91,11 +88,7 @@ class CompiledStage:
         self._observed_buckets: set[Hashable] = set()
         self._observed_without_bucket = False
 
-        if not self.enabled:
-            logger.info("Compiled stage %s is disabled; using eager execution", name)
-            return
-
-        compiler = compile_fn or torch.compile
+        compiler = torch.compile if compile_fn is None else compile_fn
         try:
             self._compiled = compiler(eager, **self._compile_kwargs)
         except Exception:
@@ -113,7 +106,6 @@ class CompiledStage:
     def stats(self) -> CompiledStageStats:
         with self._lock:
             return CompiledStageStats(
-                enabled=self.enabled,
                 compilation_count=self._compilation_count,
                 recompilation_count=max(0, self._compile_trigger_count - 1),
                 compile_time_s=self._compile_time_s,
@@ -201,7 +193,6 @@ class CompiledStage:
 
     def stats_unlocked(self) -> CompiledStageStats:
         return CompiledStageStats(
-            enabled=self.enabled,
             compilation_count=self._compilation_count,
             recompilation_count=max(0, self._compile_trigger_count - 1),
             compile_time_s=self._compile_time_s,
