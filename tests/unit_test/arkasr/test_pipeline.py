@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
-from transformers import WhisperConfig
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from transformers import WhisperConfig
 
 import sglang_omni.models.arkasr.engine_builder as arkasr_builder
 import sglang_omni.scheduling.bootstrap as bootstrap
@@ -23,8 +23,8 @@ from sglang_omni.models.arkasr.audio_tower import ArkAudioMLPAdapter, ArkAudioTo
 from sglang_omni.models.arkasr.config import ArkasrPipelineConfig
 from sglang_omni.models.arkasr.configuration_arkasr import ArkasrConfig
 from sglang_omni.models.arkasr.request_builders import _build_suppressed_token_ids
-from sglang_omni.models.arkasr.stages import create_sglang_arkasr_executor
 from sglang_omni.models.arkasr.sglang_model import ArkasrForConditionalGeneration
+from sglang_omni.models.arkasr.stages import create_sglang_arkasr_executor
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from tests.unit_test.fakes import FakeServerArgs
 
@@ -242,7 +242,9 @@ def _ark_audio_item(
             "feature_attention_mask": torch.cat(
                 [
                     torch.ones((1, valid_frames), dtype=torch.long),
-                    torch.zeros((1, feature.shape[-1] - valid_frames), dtype=torch.long),
+                    torch.zeros(
+                        (1, feature.shape[-1] - valid_frames), dtype=torch.long
+                    ),
                 ],
                 dim=1,
             )
@@ -263,7 +265,9 @@ def test_ark_get_audio_feature_batched_matches_serial_and_uses_one_encoder_call(
     def record_call(_module, args, kwargs):
         calls.append((args[0].shape, kwargs.get("attention_mask")))
 
-    handle = model.audio_encoder.register_forward_pre_hook(record_call, with_kwargs=True)
+    handle = model.audio_encoder.register_forward_pre_hook(
+        record_call, with_kwargs=True
+    )
     try:
         with torch.no_grad():
             batched = model.get_audio_feature(items)

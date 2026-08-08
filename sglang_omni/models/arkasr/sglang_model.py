@@ -63,7 +63,9 @@ class ArkasrForConditionalGeneration(nn.Module):
         and exactly match every item's precomputed audio-token span.
         """
         if not items:
-            raise ValueError("ARK-ASR get_audio_feature requires at least one audio item")
+            raise ValueError(
+                "ARK-ASR get_audio_feature requires at least one audio item"
+            )
         device = next(self.audio_encoder.parameters()).device
         dtype = self.audio_encoder.dtype
 

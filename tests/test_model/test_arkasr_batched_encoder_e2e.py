@@ -30,7 +30,6 @@ import requests
 from sglang_omni.utils import find_available_port
 from tests.utils import disable_proxy, start_server_from_cmd, stop_server
 
-
 RUN_ENV = "RUN_ARKASR_BATCHED_ENCODER_E2E"
 MODEL_PATH_ENV = "ARKASR_MODEL_PATH"
 MODEL_PATH = os.environ.get(MODEL_PATH_ENV, "")
