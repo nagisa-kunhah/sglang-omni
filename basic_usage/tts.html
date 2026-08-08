@@ -56,12 +56,12 @@
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Omni Router Usage" href="omni_router.html" />
+    <link rel="next" title="TTS Process Topology" href="tts_process_topology.html" />
     <link rel="prev" title="Omni Model Usage" href="qwen3_omni.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="Jul 27, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 08, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -217,9 +217,11 @@
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/ming_tts.html">Ming-Omni-TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/moss_tts.html">MOSS-TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/moss_tts_local.html">MOSS-TTS-Local</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/dots_tts.html">dots.tts</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/zonos2.html">ZONOS2</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_asr.html">Qwen3-ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/fun_asr.html">Fun-ASR-Nano</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/arkasr.html">ARK-ASR-3B</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/moss_transcribe_diarize.html">MOSS-Transcribe-Diarize</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/whisper_asr.html">Whisper ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_omni.html">Qwen3-Omni</a></li>
@@ -230,6 +232,7 @@
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="qwen3_omni.html">Omni Model Usage</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">TTS Model Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tts_process_topology.html">TTS Process Topology</a></li>
 <li class="toctree-l1"><a class="reference internal" href="omni_router.html">Omni Router Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="mps_dp.html">Same-GPU Data Parallelism with CUDA MPS</a></li>
 </ul>
@@ -246,6 +249,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/communication.html">Communication</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/reference_encode_service.html">Reference Encode Service</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/profiler.html">Request-level profiler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/qwen3_asr_concurrency_profile.html">Qwen3-ASR High-Concurrency Benchmark and Bottleneck Profile</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/rl_admin_control.html">RL Admin Control</a></li>
 </ul>
 
@@ -512,7 +516,7 @@
                   
   <section class="tex2jax_ignore mathjax_ignore" id="tts-model-usage">
 <h1>TTS Model Usage<a class="headerlink" href="#tts-model-usage" title="Link to this heading">#</a></h1>
-<p>This guide uses <a class="reference external" href="https://huggingface.co/fishaudio/s2-pro">Fish Speech S2-Pro</a> as an example TTS (text-to-speech) model with SGLang-Omni and the OpenAI-compatible API. The same <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> endpoint also supports Voxtral TTS, Qwen3-TTS, Ming-Omni-TTS, and MOSS-TTS.</p>
+<p>This guide uses <a class="reference external" href="https://huggingface.co/fishaudio/s2-pro">Fish Speech S2-Pro</a> as an example TTS (text-to-speech) model with SGLang-Omni and the OpenAI-compatible API. The same <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> endpoint also supports Voxtral TTS, Qwen3-TTS, Ming-Omni-TTS, MOSS-TTS, and dots.tts.</p>
 <section id="prerequisites">
 <h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
 <p>Install <code class="docutils literal notranslate"><span class="pre">sglang-omni</span></code> by following <a class="reference internal" href="../get_started/installation.html"><span class="std std-doc">Installation</span></a>, then download the model:</p>
@@ -520,7 +524,7 @@
 </pre></div>
 </div>
 <p>Qwen3-TTS uses the upstream <code class="docutils literal notranslate"><span class="pre">qwen-tts</span></code> package. Install it without dependencies
-so the SGLang-Omni Transformers 5.6 / SGLang 0.5.12.post1 stack remains in place:</p>
+so the SGLang-Omni Transformers 5.12 / SGLang 0.5.16 stack remains in place:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--upgrade<span class="w"> </span>sox<span class="w"> </span>einops
 uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--no-deps<span class="w"> </span>qwen-tts<span class="o">==</span><span class="m">0</span>.1.1
 </pre></div>
@@ -564,12 +568,18 @@ uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </s
 <td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/moss_tts.yaml</span></code></p></td>
 <td><p>Voice cloning via <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> or <code class="docutils literal notranslate"><span class="pre">references[0].audio_path</span></code> (+ <code class="docutils literal notranslate"><span class="pre">text</span></code>). Duration via <code class="docutils literal notranslate"><span class="pre">${token:N}</span></code> or <code class="docutils literal notranslate"><span class="pre">token_count</span></code>. Benchmark at <code class="docutils literal notranslate"><span class="pre">--max-concurrency</span> <span class="pre">8</span></code></p></td>
 </tr>
+<tr class="row-odd"><td><p><a class="reference external" href="https://github.com/studio-dots-ai/dots.tts">dots.tts</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/dots_tts.yaml</span></code> (MeanFlow), <code class="docutils literal notranslate"><span class="pre">examples/configs/dots_tts_soar.yaml</span></code> (SOAR)</p></td>
+<td><p>48 kHz continuous-latent TTS with reference audio. MeanFlow (<code class="docutils literal notranslate"><span class="pre">dots.tts-mf</span></code>) uses continuous batching (<code class="docutils literal notranslate"><span class="pre">max_running_requests=16</span></code> by default) with engine-wide <code class="docutils literal notranslate"><span class="pre">num_steps=4</span></code> and Euler. SOAR (<code class="docutils literal notranslate"><span class="pre">dots.tts-soar</span></code>) and base (<code class="docutils literal notranslate"><span class="pre">dots.tts-base</span></code>) are flow matching and run the single-request solver with CFG at <code class="docutils literal notranslate"><span class="pre">max_running_requests=1</span></code>; both use the SOAR config. All require <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> + <code class="docutils literal notranslate"><span class="pre">ref_text</span></code>. TP1 only</p></td>
+</tr>
 </tbody>
 </table>
 </div>
 </section>
 <section id="launch-the-server">
 <h2>Launch the Server<a class="headerlink" href="#launch-the-server" title="Link to this heading">#</a></h2>
+<p>See <a class="reference internal" href="tts_process_topology.html"><span class="std std-doc">TTS Process Topology</span></a> for model defaults,
+<code class="docutils literal notranslate"><span class="pre">--isolate-stage</span></code>, and same-GPU memory requirements.</p>
 <p>The reference-audio examples below fetch clips from Hugging Face, so the
 commands include the Hugging Face host and its current download redirect host.
 Omit those flags when your requests use only text, uploaded voices, local/file
@@ -638,6 +648,31 @@ references, or data URLs.</p>
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span>
 </pre></div>
 </div>
+<p>For dots.tts MeanFlow:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>dots-studio/dots.tts-mf<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/dots_tts.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--allowed-media-domain<span class="w"> </span>huggingface.co<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--allowed-media-domain<span class="w"> </span>cas-bridge.xethub.hf.co<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--allowed-media-domain<span class="w"> </span>us.aws.cdn.hf.co<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span>
+</pre></div>
+</div>
+<p>For dots.tts SOAR:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>dots-studio/dots.tts-soar<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/dots_tts_soar.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--allowed-media-domain<span class="w"> </span>huggingface.co<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--allowed-media-domain<span class="w"> </span>cas-bridge.xethub.hf.co<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--allowed-media-domain<span class="w"> </span>us.aws.cdn.hf.co<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">dots.tts-base</span></code> uses the same config; pass <code class="docutils literal notranslate"><span class="pre">--model-path</span> <span class="pre">dots-studio/dots.tts-base</span></code>.</p>
+<p>SOAR and base are flow-matching checkpoints, so they run the single-request solver
+(<code class="docutils literal notranslate"><span class="pre">max_running_requests=1</span></code>) with classifier-free guidance. Continuous batching is
+MeanFlow-only for now. <code class="docutils literal notranslate"><span class="pre">rednote-hilab/dots.tts-*</span></code> is the old org name and redirects to
+<code class="docutils literal notranslate"><span class="pre">dots-studio/dots.tts-*</span></code>; both work as <code class="docutils literal notranslate"><span class="pre">--model-path</span></code>.</p>
 <p>For Ming-Omni-TTS on two 80 GB GPUs:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model-path<span class="w"> </span>inclusionAI/Ming-omni-tts-16.8B-A3B<span class="w"> </span><span class="se">\</span>
@@ -686,6 +721,21 @@ Qwen3-TTS CustomVoice, Voxtral, and S2-Pro. It is not valid for Qwen3-TTS Base.<
 <span class="w">    </span>--output<span class="w"> </span>output.wav
 </pre></div>
 </div>
+<p>dots.tts accepts the same reference fields. The MeanFlow checkpoint is tuned
+for four flow steps:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8000/v1/audio/speech<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;model&quot;: &quot;dots-studio/dots.tts-mf&quot;,</span>
+<span class="s1">    &quot;voice&quot;: &quot;default&quot;,</span>
+<span class="s1">    &quot;input&quot;: &quot;Get the trust fund to the bank early.&quot;,</span>
+<span class="s1">    &quot;ref_audio&quot;: &quot;https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav&quot;,</span>
+<span class="s1">    &quot;ref_text&quot;: &quot;We asked over twenty different people, and they all said it was his.&quot;,</span>
+<span class="s1">    &quot;stage_params&quot;: {&quot;latent_engine&quot;: {&quot;num_steps&quot;: 4}}</span>
+<span class="s1">  }&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output<span class="w"> </span>dots-output.wav
+</pre></div>
+</div>
 <p>For natural-sounding Fish Speech S2-Pro results, use Voice Cloning with a reference audio clip.</p>
 <section id="fish-speech-voice-cloning">
 <h3>Fish Speech Voice Cloning<a class="headerlink" href="#fish-speech-voice-cloning" title="Link to this heading">#</a></h3>
@@ -731,9 +781,9 @@ requires both <code class="docutils literal notranslate"><span class="pre">&quot
 <p>Streaming returns 16-bit mono PCM bytes (<code class="docutils literal notranslate"><span class="pre">audio/pcm</span></code>) with sample-rate metadata
 in response headers. It does not include in-band JSON events, final usage, or a
 terminal sentinel. When the client does not set <code class="docutils literal notranslate"><span class="pre">initial_codec_chunk_frames</span></code>,
-streaming requests default to a 1-frame first vocoder chunk for lower
-first-audio latency. Set <code class="docutils literal notranslate"><span class="pre">initial_codec_chunk_frames</span></code> to <code class="docutils literal notranslate"><span class="pre">0</span></code> to use the model’s
-steady chunk size from the start.</p>
+the model selects a continuity-safe first vocoder chunk. Set the field explicitly
+to override that default, or set it to <code class="docutils literal notranslate"><span class="pre">0</span></code> to use the model’s steady chunk size
+from the start.</p>
 </section>
 <section id="batch-speech">
 <h3>Batch Speech<a class="headerlink" href="#batch-speech" title="Link to this heading">#</a></h3>
@@ -1019,7 +1069,7 @@ the SGLang-Omni server:</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">initial_codec_chunk_frames</span></code></p></td>
 <td><p>int</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">null</span></code></p></td>
-<td><p>Optional first codec chunk size for streaming TTFA tuning. Higgs TTS currently consumes this parameter first. Raw PCM speech requests default this to <code class="docutils literal notranslate"><span class="pre">1</span></code> unless the client sets a value, including <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Optional first codec chunk size for streaming TTFA tuning. When omitted, each model applies its own default: Higgs TTS uses <code class="docutils literal notranslate"><span class="pre">20</span></code>, MOSS-TTS Local uses <code class="docutils literal notranslate"><span class="pre">5</span></code>, and ZONOS2 uses <code class="docutils literal notranslate"><span class="pre">40</span></code>. An explicit <code class="docutils literal notranslate"><span class="pre">0</span></code> uses the model’s steady chunk size from the start</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">references</span></code></p></td>
 <td><p>list</p></td>
@@ -1214,11 +1264,11 @@ python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmar
       </div>
     </a>
     <a class="right-next"
-       href="omni_router.html"
+       href="tts_process_topology.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Omni Router Usage</p>
+        <p class="prev-next-title">TTS Process Topology</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -1292,7 +1342,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 27, 2026.
+  Last updated on Aug 08, 2026.
   <br/>
 </p>
   </div>
