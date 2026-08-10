@@ -220,12 +220,8 @@ class ArkAudioTower(nn.Module):
         frame_mask = None
         sdpa_mask = None
         if input_frame_mask is not None:
-            # conv2 has stride 2, kernel 3, and padding 1.  Its output index i
-            # is valid exactly when input frame 2*i is valid.
-            frame_mask = input_frame_mask[:, ::2]
-            # SDPA bool masks use True for positions that may participate in
-            # attention.  Queries are zeroed after every layer below; this
-            # mask only needs to exclude padded keys/values.
+            # note (nagisa-kunhah): Keep the downsampled mask contiguous for SDPA.
+            frame_mask = input_frame_mask[:, ::2].contiguous()
             sdpa_mask = frame_mask[:, None, None, :]
             inputs_embeds = inputs_embeds * frame_mask.unsqueeze(-1).to(
                 dtype=inputs_embeds.dtype
