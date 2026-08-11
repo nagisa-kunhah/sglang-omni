@@ -42,7 +42,7 @@
   <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
-    <script src="../_static/documentation_options.js?v=a1637f0b"></script>
+    <script src="../_static/documentation_options.js?v=1a9ffd16"></script>
     <script src="../_static/doctools.js?v=fd6eb6e6"></script>
     <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -60,8 +60,8 @@
     <link rel="prev" title="ARK-ASR-3B" href="arkasr.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="Aug 08, 2026"/>
+  <meta name="docsearch:version" content="0.1.1" />
+    <meta name="docbuild:last-update" content="Aug 11, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -207,6 +207,7 @@
         <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/release_notes.html">Release Notes</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Cookbook</span></p>
 <ul class="current nav bd-sidenav">
@@ -814,6 +815,15 @@ python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmar
 <span class="w">  </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.80<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--output-dir<span class="w"> </span>results/moss_transcribe_diarize_movies800times
 
+<span class="c1"># note (Xinyu): Add one dedicated request-event profiling pass after the measured</span>
+<span class="c1"># evaluation. This pass is excluded from reported accuracy and speed metrics.</span>
+python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmark_asr_transcribe_diarize<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dataset<span class="w"> </span>movies800times<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--concurrency<span class="w"> </span><span class="m">16</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--profile-events<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--profile-event-dir<span class="w"> </span>/tmp/moss_td_bench_profile<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output-dir<span class="w"> </span>results/moss_transcribe_diarize_movies800times_profile
+
 <span class="c1"># Long-sequence ASR / diarization</span>
 python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmark_asr_transcribe_diarize<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--dataset<span class="w"> </span>aishell4_long<span class="w"> </span><span class="se">\</span>
@@ -837,6 +847,13 @@ python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmar
 <span class="w">  </span>--output-dir<span class="w"> </span>results/moss_transcribe_diarize_googletime
 </pre></div>
 </div>
+<p><code class="docutils literal notranslate"><span class="pre">--profile-events</span></code> starts request-level event recording through the serve
+profiler endpoints, runs one extra pass, and adds its <code class="docutils literal notranslate"><span class="pre">stage_breakdown</span></code>,
+<code class="docutils literal notranslate"><span class="pre">hop_breakdown</span></code>, and speed metrics under <code class="docutils literal notranslate"><span class="pre">profile</span></code> in both
+<code class="docutils literal notranslate"><span class="pre">transcribe_diarize_results.json</span></code> and <code class="docutils literal notranslate"><span class="pre">transcribe_diarize_speed_results.json</span></code>.
+The event directory is a server-side path, so report generation requires the
+benchmark process to see the same filesystem. For router or DP deployments,
+pass every worker serve URL with a comma-separated <code class="docutils literal notranslate"><span class="pre">--profile-urls</span></code> value.</p>
 </section>
 <section id="benchmark-results">
 <h2>Benchmark Results<a class="headerlink" href="#benchmark-results" title="Link to this heading">#</a></h2>
@@ -1050,7 +1067,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 08, 2026.
+  Last updated on Aug 11, 2026.
   <br/>
 </p>
   </div>
