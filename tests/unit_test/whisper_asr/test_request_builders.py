@@ -30,6 +30,9 @@ class _FakeTokenizer:
     pad_token_id = 3
     vocab_size = 51865
 
+    def __init__(self) -> None:
+        self.prefix_calls: list[tuple[str, str, bool]] = []
+
     def __len__(self) -> int:
         return 51866
 
@@ -40,6 +43,7 @@ class _FakeTokenizer:
         self, *, language: str, task: str, predict_timestamps: bool
     ) -> None:
         assert predict_timestamps is False
+        self.prefix_calls.append((language, task, predict_timestamps))
         self.prefix_language = language
         self.prefix_task = task
 
@@ -123,6 +127,24 @@ def test_request_builder_without_prompt_keeps_prefix_only(monkeypatch) -> None:
     expected = [pad_id] * _ENCODER_TOKEN_COUNT + _PREFIX
     assert data.input_ids.tolist() == expected
     assert data.prompt_token_ids == _PREFIX
+
+
+def test_request_builder_reuses_prefix_for_canonical_language(monkeypatch) -> None:
+    tokenizer = _FakeTokenizer()
+    request_builder = _make_request_builder(tokenizer)
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(1600, dtype=np.float32),
+    )
+
+    first = request_builder(_make_payload({"language": "en"}))
+    second = request_builder(_make_payload({"language": "english"}))
+
+    assert tokenizer.prefix_calls == [("english", "transcribe", False)]
+    assert first.input_ids.tolist() == second.input_ids.tolist()
+    assert first.prompt_token_ids == second.prompt_token_ids == _PREFIX
+    assert first.prompt_token_ids is not second.prompt_token_ids
 
 
 def test_request_builder_maps_prompt_to_prev_context(monkeypatch) -> None:

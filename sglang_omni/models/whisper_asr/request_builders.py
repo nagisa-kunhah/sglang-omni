@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 from threading import Lock
-from typing import Any, Callable
+from typing import Any
 
 import torch
 from sglang.srt.managers.schedule_batch import (
@@ -66,15 +68,6 @@ def _build_logit_bias(generation_config: GenerationConfig) -> dict[str, float] |
     if not suppress_tokens:
         return None
     return {str(int(token_id)): -1.0e9 for token_id in suppress_tokens if token_id >= 0}
-
-
-def _build_prefix_tokens(tokenizer: Any, *, language: str, task: str) -> list[int]:
-    tokenizer.set_prefix_tokens(
-        language=language,
-        task=task,
-        predict_timestamps=False,
-    )
-    return list(tokenizer.prefix_tokens)
 
 
 def _decoder_token_budgets(
@@ -142,6 +135,8 @@ def make_whisper_scheduler_adapters(
     id_to_language = {
         int(token_id): token.strip("<|>") for token, token_id in lang_to_id.items()
     }
+    encoder_pad_token_ids = (pad_token_id,) * encoder_token_count
+    vocab_size = len(tokenizer)
     # note (jiannan-17): Prefer the decoder limit passed by the caller. Fall back
     # to generation_config.max_length, then to Whisper's default 448 positions.
     decoder_context_len = int(
@@ -149,6 +144,15 @@ def make_whisper_scheduler_adapters(
         or getattr(generation_config, "max_length", None)
         or _DEFAULT_DECODER_CONTEXT_LEN
     )
+
+    @lru_cache(maxsize=None)
+    def _prefix_token_ids(language: str, task: str) -> tuple[int, ...]:
+        tokenizer.set_prefix_tokens(
+            language=language,
+            task=task,
+            predict_timestamps=False,
+        )
+        return tuple(tokenizer.prefix_tokens)
 
     def request_builder(payload: StagePayload) -> WhisperASRRequestData:
         params = payload.request.params or {}
@@ -171,11 +175,7 @@ def make_whisper_scheduler_adapters(
             request_max_new_tokens = 1
         else:
             with tokenizer_lock:
-                prefix_token_ids = _build_prefix_tokens(
-                    tokenizer,
-                    language=language,
-                    task=task,
-                )
+                prefix_token_ids = _prefix_token_ids(language, task)
                 request_max_new_tokens, max_prev_tokens = _decoder_token_budgets(
                     decoder_context_len=decoder_context_len,
                     prefix_len=len(prefix_token_ids),
@@ -195,7 +195,7 @@ def make_whisper_scheduler_adapters(
                 f"{len(prompt_token_ids)} input tokens + "
                 f"{request_max_new_tokens} max_new_tokens > {decoder_context_len}"
             )
-        input_ids = [pad_token_id] * encoder_token_count + prompt_token_ids
+        input_ids = [*encoder_pad_token_ids, *prompt_token_ids]
 
         features = processor.feature_extractor(
             audio,
