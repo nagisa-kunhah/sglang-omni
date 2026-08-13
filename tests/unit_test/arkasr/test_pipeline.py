@@ -57,6 +57,7 @@ def test_arkasr_config_registered():
     assert config.entry_stage == "asr"
     assert config.stages[0].name == "asr"
     assert config.stages[0].terminal
+    assert config.stages[0].factory_args["encoder_max_batch_size"] == 8
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("ArkasrForConditionalGeneration")
         is ArkasrPipelineConfig
@@ -66,6 +67,7 @@ def test_arkasr_config_registered():
 def test_arkasr_stage_defaults():
     signature = inspect.signature(create_sglang_arkasr_executor)
     assert signature.parameters["max_running_requests"].default == 32
+    assert signature.parameters["encoder_max_batch_size"].default == 8
     assert signature.parameters["request_build_max_workers"].default == 2
     assert signature.parameters["request_build_max_pending"].default == 16
 
@@ -88,8 +90,12 @@ def test_arkasr_factory_triggers_deferred_cuda_graph_capture(
     graph_init_workers: list[object] = []
     adapter_kwargs: dict[str, object] = {}
 
+    encoder_batch_sizes: list[int] = []
     model_worker = SimpleNamespace(
-        gpu_id=0, model_runner=SimpleNamespace(model=object())
+        gpu_id=0,
+        model_runner=SimpleNamespace(
+            model=SimpleNamespace(set_encoder_max_batch_size=encoder_batch_sizes.append)
+        ),
     )
     infra = (want_cuda_graph, (model_worker, None, None, None, None, None, None))
 
@@ -184,6 +190,7 @@ def test_arkasr_factory_triggers_deferred_cuda_graph_capture(
     # here instead of at serve time.
     assert scheduler.server_args.context_length == 2000 // 2 + 256 + 8
     assert infra_kwargs_seen["model_arch_override"] == "ArkasrForConditionalGeneration"
+    assert encoder_batch_sizes == [8]
 
 
 def test_arkasr_audio_token_count():
@@ -228,6 +235,7 @@ def _tiny_ark_audio_mm_model() -> ArkasrForConditionalGeneration:
     model = ArkasrForConditionalGeneration.__new__(ArkasrForConditionalGeneration)
     nn.Module.__init__(model)
     model.audio_encoder = ArkAudioMLPAdapter(_tiny_config()).eval()
+    model.encoder_max_batch_size = model.DEFAULT_ENCODER_MAX_BATCH_SIZE
     return model
 
 
@@ -284,6 +292,36 @@ def test_ark_get_audio_feature_batched_matches_serial_and_uses_one_encoder_call(
         sum(arkasr_num_audio_tokens(length) for length in lengths),
         48,
     )
+    assert torch.allclose(batched, serial, atol=1e-5, rtol=1e-5)
+
+
+def test_ark_get_audio_feature_splits_large_batches_in_order():
+    torch.manual_seed(4)
+    model = _tiny_ark_audio_mm_model()
+    model.set_encoder_max_batch_size(2)
+    lengths = [9, 18, 25, 12, 20]
+    items = [
+        _ark_audio_item(torch.randn(1, 8, length), length, hash_id=200 + index)
+        for index, length in enumerate(lengths)
+    ]
+    calls = []
+
+    def record_call(_module, args, kwargs):
+        calls.append((args[0].shape, kwargs.get("attention_mask")))
+
+    handle = model.audio_encoder.register_forward_pre_hook(
+        record_call, with_kwargs=True
+    )
+    try:
+        with torch.no_grad():
+            batched = model.get_audio_feature(items)
+            serial = torch.cat(
+                [model.get_audio_feature([item]) for item in items], dim=0
+            )
+    finally:
+        handle.remove()
+
+    assert [shape[0][0] for shape in calls[:3]] == [2, 2, 1]
     assert torch.allclose(batched, serial, atol=1e-5, rtol=1e-5)
 
 

@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 
 class ArkasrForConditionalGeneration(nn.Module):
+    DEFAULT_ENCODER_MAX_BATCH_SIZE = 8
+
     def __init__(
         self,
         config: ArkasrConfig,
@@ -51,21 +53,43 @@ class ArkasrForConditionalGeneration(nn.Module):
             prefix=add_prefix("language_model", prefix),
         )
         self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        self.encoder_max_batch_size = self.DEFAULT_ENCODER_MAX_BATCH_SIZE
+
+    def set_encoder_max_batch_size(self, max_batch_size: int) -> None:
+        if max_batch_size < 1:
+            raise ValueError(
+                f"encoder_max_batch_size must be >= 1, got {max_batch_size}"
+            )
+        self.encoder_max_batch_size = int(max_batch_size)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        """Pad+mask batch-encode variable-length mel features.
+        """Encode cache-miss audio items in bounded sequential microbatches.
 
         SGLang calls this once for every audio embedding-cache miss in a
-        forward batch.  The flattened result must therefore retain item order
-        and exactly match every item's precomputed audio-token span.
+        forward batch.  The flattened result must retain item order and exactly
+        match every item's precomputed audio-token span.  Request concurrency
+        is intentionally independent from encoder batch size: large miss
+        batches are split into sequential encoder forwards to bound activation
+        memory.
         """
         if not items:
             raise ValueError(
                 "ARK-ASR get_audio_feature requires at least one audio item"
             )
+        outputs = []
+        for start in range(0, len(items), self.encoder_max_batch_size):
+            outputs.append(
+                self._encode_audio_batch(
+                    items[start : start + self.encoder_max_batch_size]
+                )
+            )
+        return torch.cat(outputs, dim=0)
+
+    def _encode_audio_batch(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        """Pad and encode one bounded batch of audio items."""
         device = next(self.audio_encoder.parameters()).device
         dtype = self.audio_encoder.dtype
 
