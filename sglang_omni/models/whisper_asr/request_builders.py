@@ -173,7 +173,7 @@ def make_whisper_scheduler_adapters(
             sampling_rate=_WHISPER_SAMPLE_RATE,
             return_tensors="pt",
         ).input_features
-        # StageOutputCache provides the lock, LRU recency update, and bounded
+        # note (xinran): StageOutputCache provides the lock, LRU recency update, and bounded
         # eviction. The cache owns a detached snapshot; each hit still returns
         # a private clone because downstream request handling may mutate or
         # release its feature tensor in-place.
