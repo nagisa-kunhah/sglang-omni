@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.1" />
-    <meta name="docbuild:last-update" content="Aug 13, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 15, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -207,6 +207,7 @@
         <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_xpu.html">🚀 Installation — Intel XPU</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../get_started/release_notes.html">Release Notes</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Cookbook</span></p>
@@ -233,6 +234,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">General Usage</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/qwen3_omni.html">Omni Model Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/audio_translations.html">Audio Translations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/tts.html">TTS Model Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/tts_process_topology.html">TTS Process Topology</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/omni_router.html">Omni Router Usage</a></li>
@@ -520,6 +522,7 @@
   <section class="tex2jax_ignore mathjax_ignore" id="moss-transcribe-diarize">
 <h1>MOSS-Transcribe-Diarize<a class="headerlink" href="#moss-transcribe-diarize" title="Link to this heading">#</a></h1>
 <p><a class="reference external" href="https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize">MOSS-Transcribe-Diarize</a> is a multi-speaker ASR and diarization model from the OpenMOSS team.</p>
+<p>MOSS-Transcribe-Diarize does not support <code class="docutils literal notranslate"><span class="pre">/v1/audio/translations</span></code>; that endpoint returns HTTP 400. Use <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code>.</p>
 <p><img alt="Model Architecture" src="https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/main/Model_Architecture.png" /></p>
 <p>It transcribes speech, assigns speakers, and predicts timestamps in a single generation pass. With 128K context, it supports up to ~90-minute audio, handles meetings, interruptions, long conversations, and overlapping speech, and adds hotword boosting for names, companies, product terms, and domain vocabulary. MOSS-Transcribe-Diarize is served through the OpenAI-compatible <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code> endpoint.</p>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -1075,7 +1078,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 13, 2026.
+  Last updated on Aug 15, 2026.
   <br/>
 </p>
   </div>
