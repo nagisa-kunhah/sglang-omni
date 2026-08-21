@@ -51,7 +51,11 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
             name="vocoder",
             process="pipeline",
             factory_path=f"{_PKG}.stages.create_vocoder_executor",
-            factory=FactoryArgs(dtype="bfloat16"),
+            factory_args={
+                "dtype": "bfloat16",
+                "enable_flow_batch": True,
+                "flow_batch_bucket_frames": 50,
+            },
             gpu=0,
             terminal=True,
         ),
