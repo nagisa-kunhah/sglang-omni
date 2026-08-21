@@ -61,6 +61,45 @@ sgl-omni serve \
   --port 8000
 ```
 
+### Flow Decoder Batching
+
+The buffered vocoder batches the Flow decoder by default. `SimpleScheduler` collects up to
+8 requests for at most 2 ms, then the vocoder groups those requests by total mel length in
+50-frame buckets. Each bucket containing at least two compatible requests runs token
+embedding, pre-lookahead, DiT, and CFM Euler/CFG inference as one true batch. The 50-frame
+default matches the current DiT estimator's static chunk size; a larger bucket can combine
+more requests at the cost of additional padding, compute, and peak GPU memory.
+
+HiFT still runs once per request. A bucket containing only one request always uses
+CosyVoice's original `flow.inference()` implementation. The adapter only supports the
+PyTorch estimator and buffered `streaming=False, finalize=True` inference. TensorRT
+estimator pools and incompatible future CosyVoice structures log one startup warning and
+automatically use the original serial Flow path.
+
+Disable Flow batching without changing request behavior:
+
+```bash
+sgl-omni serve \
+  --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+  --config examples/configs/fun_cosyvoice3_0_5b.yaml \
+  --port 8000 \
+  --stages.vocoder.factory_args.enable_flow_batch false
+```
+
+Change the mel-frame bucket size, for example to 100 frames:
+
+```bash
+sgl-omni serve \
+  --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+  --config examples/configs/fun_cosyvoice3_0_5b.yaml \
+  --port 8000 \
+  --stages.vocoder.factory_args.flow_batch_bucket_frames 100
+```
+
+The local adapter is tied to the Flow/CFM structure in the documented CosyVoice commit
+`074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc`. It does not modify or monkey-patch the
+CosyVoice checkout.
+
 ## Synthesizing Speech
 
 ### Zero-shot Voice Cloning
@@ -219,6 +258,8 @@ will use `response_format="pcm"` and emit audio before speech-token generation c
 - **Voice conversion.** Voice conversion is outside the current zero-shot TTS scope.
 - **Streaming decode.** The current implementation buffers all speech tokens before Flow + HiFT
   decoding. Incremental PCM output is planned but is not yet available.
+- **Flow batch scope.** Flow batching currently supports only the PyTorch estimator. HiFT
+  remains serial, and streaming Flow/HiFT batching is outside the current buffered decoder.
 - **cosyvoice dependency.** The `cosyvoice` package has no PyPI release and must be
   installed from GitHub. Matcha-TTS is a required submodule and must also be importable;
   only the CosyVoice Flow and HiFT paths are used by the buffered decoder.
