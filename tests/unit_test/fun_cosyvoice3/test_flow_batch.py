@@ -131,9 +131,10 @@ def test_pack_flow_inputs_keeps_prompt_and_target_contiguous() -> None:
 
     assert packed.token.dtype == torch.int32
     assert packed.token.tolist() == [[4, 0, 8, 0], [5, 6, 7, 0]]
-    assert packed.combined_token_lengths.tolist() == [4, 4]
-    assert packed.prompt_token_lengths.tolist() == [1, 3]
-    assert packed.target_token_lengths.tolist() == [3, 1]
+    assert packed.combined_token_lengths == (4, 4)
+    assert packed.prompt_token_lengths == (1, 3)
+    assert packed.target_token_lengths == (3, 1)
+    assert packed.combined_token_lengths_tensor.tolist() == [4, 4]
     assert packed.token_mask.squeeze(-1).tolist() == [
         [True, True, True, True],
         [True, True, True, True],
@@ -154,8 +155,9 @@ def test_pack_flow_inputs_builds_variable_length_token_masks() -> None:
         [True, False, False, False],
         [True, True, True, True],
     ]
-    assert packed.prompt_mel_lengths.tolist() == [0, 4]
-    assert packed.total_mel_lengths.tolist() == [2, 8]
+    assert packed.prompt_mel_lengths == (0, 4)
+    assert packed.total_mel_lengths == (2, 8)
+    assert packed.total_mel_lengths_tensor.tolist() == [2, 8]
 
 
 def test_flow_batch_builds_variable_length_mel_masks_and_conditions() -> None:
