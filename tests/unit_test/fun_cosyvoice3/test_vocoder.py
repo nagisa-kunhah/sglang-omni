@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from types import SimpleNamespace
 
 import pytest
@@ -13,18 +12,6 @@ from sglang_omni.models.fun_cosyvoice3 import stages
 from sglang_omni.models.fun_cosyvoice3.config import FunCosyVoice3PipelineConfig
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.proto import OmniRequest, StagePayload
-
-
-class _FakeFlow(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.anchor = torch.nn.Parameter(torch.zeros(1))
-        self.calls = []
-
-    def inference(self, **kwargs):
-        self.calls.append(kwargs)
-        token_count = kwargs["token"].shape[1]
-        return torch.ones(1, 80, token_count * 2), None
 
 
 class _FakeHiFT(torch.nn.Module):
@@ -44,9 +31,10 @@ class _FakeEstimator(torch.nn.Module):
         raise AssertionError("batch adapter should be mocked in vocoder unit tests")
 
 
-class _BatchCapableFakeFlow(_FakeFlow):
+class _BatchCapableFakeFlow(torch.nn.Module):
     def __init__(self):
         super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
         self.output_size = 80
         self.token_mel_ratio = 2
         self.input_embedding = torch.nn.Embedding(32, 80)
@@ -69,49 +57,8 @@ def _payload(state: FunCosyVoice3State) -> StagePayload:
     )
 
 
-def test_cosyvoice3_vocoder_does_not_pad_or_rescale_short_sequences() -> None:
-    flow = _FakeFlow()
-    hift = _FakeHiFT()
-    vocoder = stages._CosyVoice3Vocoder(flow, hift)
-
-    # note: token id 0 is a valid FSQ speech token, not padding — the
-    # vocoder must feed exactly what the AR stage generated through
-    # untouched, with no minimum-length padding and no speed rescaling
-    # (speed is applied once, downstream, on the decoded waveform).
-    wav = vocoder._token2wav(
-        token=torch.tensor([[0, 2]], dtype=torch.long),
-        prompt_token=torch.tensor([[4]], dtype=torch.int32),
-        prompt_feat=torch.zeros(1, 2, 80),
-        embedding=torch.ones(1, 192),
-    )
-
-    flow_call = flow.calls[0]
-    assert flow_call["token"].shape == (1, 2)
-    assert flow_call["token"].tolist() == [[0, 2]]
-    assert flow_call["token_len"].tolist() == [2]
-    assert flow_call["prompt_token_len"].tolist() == [1]
-    assert flow_call["prompt_feat_len"].tolist() == [2]
-    assert flow_call["finalize"] is True
-    assert (
-        hift.calls[0][0].shape[-1] == 4
-    )  # _FakeFlow returns token_count * 2 mel frames
-    assert wav.device.type == "cpu"
-
-
-def test_cosyvoice3_vocoder_raises_on_empty_token_sequence() -> None:
-    vocoder = stages._CosyVoice3Vocoder(_FakeFlow(), _FakeHiFT())
-
-    with pytest.raises(RuntimeError, match="no usable speech tokens"):
-        vocoder._token2wav(
-            token=torch.zeros(1, 0, dtype=torch.long),
-            prompt_token=torch.tensor([[4]], dtype=torch.int32),
-            prompt_feat=torch.zeros(1, 2, 80),
-            embedding=torch.ones(1, 192),
-        )
-
-
 def test_cosyvoice3_vocoder_prepare_and_store_audio_payload() -> None:
-    vocoder = stages._CosyVoice3Vocoder(_FakeFlow(), _FakeHiFT())
+    vocoder = stages._CosyVoice3Vocoder(_BatchCapableFakeFlow(), _FakeHiFT())
     state = FunCosyVoice3State(
         text="hello",
         audio_codes=torch.tensor([[1, 2], [3, 4]]),
@@ -135,7 +82,7 @@ def test_cosyvoice3_vocoder_prepare_and_store_audio_payload() -> None:
 
 
 def test_cosyvoice3_vocoder_rejects_payload_without_audio_codes() -> None:
-    vocoder = stages._CosyVoice3Vocoder(_FakeFlow(), _FakeHiFT())
+    vocoder = stages._CosyVoice3Vocoder(_BatchCapableFakeFlow(), _FakeHiFT())
     payload = _payload(FunCosyVoice3State(text="hello"))
 
     with pytest.raises(RuntimeError, match="requires audio_codes"):
@@ -143,7 +90,7 @@ def test_cosyvoice3_vocoder_rejects_payload_without_audio_codes() -> None:
 
 
 def test_cosyvoice3_vocoder_rejects_missing_audio_output() -> None:
-    vocoder = stages._CosyVoice3Vocoder(_FakeFlow(), _FakeHiFT())
+    vocoder = stages._CosyVoice3Vocoder(_BatchCapableFakeFlow(), _FakeHiFT())
     state = FunCosyVoice3State(text="hello")
     payload = _payload(state)
 
@@ -151,8 +98,10 @@ def test_cosyvoice3_vocoder_rejects_missing_audio_output() -> None:
         vocoder.store_result(payload, state, None, 24000)
 
 
-def test_cosyvoice3_vocoder_decode_batch_uses_state_conditioning() -> None:
-    flow = _FakeFlow()
+def test_cosyvoice3_vocoder_decode_batch_uses_state_conditioning(monkeypatch) -> None:
+    flow = _BatchCapableFakeFlow()
+    batch_calls: list[list] = []
+    _install_fake_batch_adapter(monkeypatch, batch_calls)
     vocoder = stages._CosyVoice3Vocoder(flow, _FakeHiFT())
     state = FunCosyVoice3State(
         speed=1.5,
@@ -165,7 +114,7 @@ def test_cosyvoice3_vocoder_decode_batch_uses_state_conditioning() -> None:
 
     assert len(results) == 1
     assert results[0][1] == 24000
-    assert flow.calls[0]["prompt_token"].tolist() == [[5]]
+    assert batch_calls[0][0].prompt_token.tolist() == [[5]]
 
 
 def _state(
@@ -203,26 +152,30 @@ def _install_fake_batch_adapter(monkeypatch, calls: list[list]) -> None:
     monkeypatch.setattr(stages, "infer_flow_batch", fake_infer)
 
 
-def test_decode_batch_size_one_uses_upstream_inference() -> None:
+def test_decode_batch_size_one_uses_batch_adapter(monkeypatch) -> None:
     flow = _BatchCapableFakeFlow()
     hift = _FakeHiFT()
-    vocoder = stages._CosyVoice3Vocoder(flow, hift, enable_flow_batch=True)
+    batch_calls: list[list] = []
+    _install_fake_batch_adapter(monkeypatch, batch_calls)
+    vocoder = stages._CosyVoice3Vocoder(flow, hift)
 
     results = asyncio.run(vocoder.decode_batch([(_state(), _codes(2))]))
 
     assert len(results) == 1
-    assert len(flow.calls) == 1
+    assert [len(call) for call in batch_calls] == [1]
     assert len(hift.calls) == 1
 
 
-def test_decode_batch_disabled_uses_serial_flow() -> None:
+def test_decode_batch_singleton_buckets_use_batch_adapter(monkeypatch) -> None:
     flow = _BatchCapableFakeFlow()
     hift = _FakeHiFT()
-    vocoder = stages._CosyVoice3Vocoder(flow, hift, enable_flow_batch=False)
+    batch_calls: list[list] = []
+    _install_fake_batch_adapter(monkeypatch, batch_calls)
+    vocoder = stages._CosyVoice3Vocoder(flow, hift)
 
-    asyncio.run(vocoder.decode_batch([(_state(), _codes(2)), (_state(), _codes(3))]))
+    asyncio.run(vocoder.decode_batch([(_state(), _codes(2)), (_state(), _codes(26))]))
 
-    assert len(flow.calls) == 2
+    assert [len(call) for call in batch_calls] == [1, 1]
     assert len(hift.calls) == 2
 
 
@@ -237,7 +190,6 @@ def test_decode_batch_same_bucket_batches_flow_once(monkeypatch) -> None:
 
     assert len(batch_calls) == 1
     assert len(batch_calls[0]) == 2
-    assert flow.calls == []
     assert len(hift.calls) == 2
 
 
@@ -262,18 +214,6 @@ def test_decode_batch_different_buckets_do_not_share_padding(monkeypatch) -> Non
     ]
 
 
-def test_decode_batch_singleton_bucket_uses_serial_path(monkeypatch) -> None:
-    flow = _BatchCapableFakeFlow()
-    batch_calls: list[list] = []
-    _install_fake_batch_adapter(monkeypatch, batch_calls)
-    vocoder = stages._CosyVoice3Vocoder(flow, _FakeHiFT())
-
-    asyncio.run(vocoder.decode_batch([(_state(), _codes(2)), (_state(), _codes(26))]))
-
-    assert batch_calls == []
-    assert len(flow.calls) == 2
-
-
 def test_decode_batch_preserves_input_order_across_buckets(monkeypatch) -> None:
     flow = _BatchCapableFakeFlow()
     batch_calls: list[list] = []
@@ -292,49 +232,37 @@ def test_decode_batch_preserves_input_order_across_buckets(monkeypatch) -> None:
     assert [len(call) for call in batch_calls] == [2, 2]
 
 
-def test_decode_batch_unsupported_flow_falls_back_to_serial(caplog) -> None:
-    flow = _FakeFlow()
-    with caplog.at_level(logging.WARNING):
-        vocoder = stages._CosyVoice3Vocoder(flow, _FakeHiFT())
-
-    asyncio.run(vocoder.decode_batch([(_state(), _codes(2)), (_state(), _codes(3))]))
-
-    assert len(flow.calls) == 2
-    assert "Flow batch" in caplog.text
-    assert "missing required attribute" in caplog.text
-
-
-def test_decode_batch_alignment_mismatch_uses_serial_flow(monkeypatch) -> None:
+def test_vocoder_rejects_non_pytorch_flow_estimator() -> None:
     flow = _BatchCapableFakeFlow()
-    batch_calls: list[list] = []
-    _install_fake_batch_adapter(monkeypatch, batch_calls)
+    flow.decoder.estimator = object()
+
+    with pytest.raises(RuntimeError, match="PyTorch Flow estimator"):
+        stages._CosyVoice3Vocoder(flow, _FakeHiFT())
+
+
+def test_decode_batch_alignment_mismatch_fails() -> None:
+    flow = _BatchCapableFakeFlow()
     vocoder = stages._CosyVoice3Vocoder(flow, _FakeHiFT())
 
-    asyncio.run(
-        vocoder.decode_batch(
-            [
-                (_state(prompt_tokens=1, prompt_feat_frames=1), _codes(2)),
-                (_state(), _codes(3)),
-            ]
+    with pytest.raises(ValueError, match="prompt feature length"):
+        asyncio.run(
+            vocoder.decode_batch(
+                [
+                    (_state(prompt_tokens=1, prompt_feat_frames=1), _codes(2)),
+                    (_state(), _codes(3)),
+                ]
+            )
         )
-    )
-
-    assert batch_calls == []
-    assert len(flow.calls) == 2
 
 
-def test_decode_batch_embedding_width_mismatch_uses_serial_flow(monkeypatch) -> None:
+def test_decode_batch_embedding_width_mismatch_fails() -> None:
     flow = _BatchCapableFakeFlow()
-    batch_calls: list[list] = []
-    _install_fake_batch_adapter(monkeypatch, batch_calls)
     vocoder = stages._CosyVoice3Vocoder(flow, _FakeHiFT())
     invalid = _state()
     invalid.flow_embedding = torch.ones(1, 191)
 
-    asyncio.run(vocoder.decode_batch([(invalid, _codes(2)), (_state(), _codes(3))]))
-
-    assert batch_calls == []
-    assert len(flow.calls) == 2
+    with pytest.raises(ValueError, match="embedding width"):
+        asyncio.run(vocoder.decode_batch([(invalid, _codes(2)), (_state(), _codes(3))]))
 
 
 def test_decode_batch_does_not_retry_after_batch_failure(monkeypatch) -> None:
@@ -351,7 +279,6 @@ def test_decode_batch_does_not_retry_after_batch_failure(monkeypatch) -> None:
         asyncio.run(
             vocoder.decode_batch([(_state(), _codes(2)), (_state(), _codes(3))])
         )
-    assert flow.calls == []
 
 
 def test_vocoder_rejects_non_positive_flow_bucket_size() -> None:
@@ -394,7 +321,6 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
         dtype="float16",
         max_batch_size=6,
         max_batch_wait_ms=7,
-        enable_flow_batch=False,
         flow_batch_bucket_frames=100,
     )
 
@@ -403,14 +329,13 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
         "flow": fake_flow,
         "hift": fake_hift,
         "fp16": True,
-        "enable_flow_batch": False,
         "flow_batch_bucket_frames": 100,
         "scheduler_max_batch_size": 6,
         "scheduler_max_batch_wait_ms": 7,
     }
 
 
-def test_pipeline_config_enables_flow_batch_by_default() -> None:
+def test_pipeline_config_sets_flow_batch_bucket_by_default() -> None:
     vocoder_stage = next(
         stage
         for stage in FunCosyVoice3PipelineConfig(model_path="model").stages
@@ -419,6 +344,5 @@ def test_pipeline_config_enables_flow_batch_by_default() -> None:
 
     assert vocoder_stage.factory_args == {
         "dtype": "bfloat16",
-        "enable_flow_batch": True,
         "flow_batch_bucket_frames": 50,
     }

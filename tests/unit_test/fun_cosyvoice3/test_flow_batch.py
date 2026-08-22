@@ -8,7 +8,6 @@ import torch
 from sglang_omni.models.fun_cosyvoice3.flow_batch import (
     FlowBatchInput,
     _pack_flow_inputs,
-    flow_batch_unsupported_reason,
     infer_flow_batch,
 )
 
@@ -119,19 +118,6 @@ def _input(
         prompt_feat=torch.full((1, len(prompt_token) * 2, channels), prompt_value),
         embedding=torch.tensor([embedding]),
     )
-
-
-def test_flow_batch_supports_pinned_cosyvoice_structure() -> None:
-    assert flow_batch_unsupported_reason(_FakeFlow()) is None
-
-
-def test_flow_batch_rejects_non_torch_estimator() -> None:
-    flow = _FakeFlow(estimator=object())
-
-    reason = flow_batch_unsupported_reason(flow)
-
-    assert reason is not None
-    assert "torch.nn.Module" in reason
 
 
 def test_pack_flow_inputs_keeps_prompt_and_target_contiguous() -> None:
