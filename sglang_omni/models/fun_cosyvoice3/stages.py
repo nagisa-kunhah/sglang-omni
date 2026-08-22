@@ -29,6 +29,11 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 from sglang_omni.utils.checkpoint import resolve_checkpoint
 from sglang_omni.utils.device import resolve_device_spec
 
+# This is an admission budget, not a maximum supported request length. The
+# scheduler admits a request that exceeds it as a singleton Flow batch and
+# defers following requests to the next batch.
+_DEFAULT_FLOW_BATCH_ADMISSION_FRAMES = 2000
+
 _COSYVOICE_INSTALL_HINT = (
     "Fun-CosyVoice3 support requires the `cosyvoice` package. "
     "Clone the official repository and set PYTHONPATH, or install it "
@@ -156,7 +161,8 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
                 device_type=current_platform.device_type, enabled=self._fp16
             ):
                 mel_list = infer_flow_batch(
-                    self._flow, [request.flow_input for request in bucket]
+                    self._flow,
+                    [request.flow_input for request in bucket],
                 )
             for request, mel in zip(bucket, mel_list, strict=True):
                 results[request.index] = (
@@ -167,6 +173,14 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         if any(result is None for result in results):
             raise RuntimeError("Fun-CosyVoice3 vocoder did not decode every request")
         return [cast(tuple[Any, int], result) for result in results]
+
+    async def decode_payload(self, payload: StagePayload) -> StagePayload:
+        results = await self.decode_payloads([payload])
+        if len(results) != 1:
+            raise RuntimeError(
+                f"Fun-CosyVoice3 vocoder returned {len(results)} results for 1 input"
+            )
+        return results[0]
 
     def _make_flow_input(
         self,
@@ -198,11 +212,23 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         )
 
     def _flow_bucket_key(self, item: FlowBatchInput) -> int:
-        total_tokens = item.prompt_token.shape[1] + item.token.shape[1]
-        total_mel = total_tokens * self._flow.token_mel_ratio
+        total_mel = self._flow_total_mel_frames(item)
         return (
             total_mel + self._flow_batch_bucket_frames - 1
         ) // self._flow_batch_bucket_frames
+
+    def _flow_total_mel_frames(self, item: FlowBatchInput) -> int:
+        total_tokens = item.prompt_token.shape[1] + item.token.shape[1]
+        return total_tokens * self._flow.token_mel_ratio
+
+    def _flow_scheduler_cost(self, payload: StagePayload) -> int:
+        state, codes = self.prepare_item(payload)
+        total_mel = self._flow_total_mel_frames(self._make_flow_input(state, codes))
+        return (
+            (total_mel + self._flow_batch_bucket_frames - 1)
+            // self._flow_batch_bucket_frames
+            * self._flow_batch_bucket_frames
+        )
 
     def _mel2wav(self, tts_mel: torch.Tensor) -> torch.Tensor:
         tts_speech, _ = self._hift.inference(speech_feat=tts_mel, finalize=True)
@@ -241,7 +267,10 @@ def create_vocoder_executor(
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
     flow_batch_bucket_frames: int = 50,
+    flow_batch_admission_frames: int = _DEFAULT_FLOW_BATCH_ADMISSION_FRAMES,
 ) -> SimpleScheduler:
+    if flow_batch_admission_frames <= 0:
+        raise ValueError("flow_batch_admission_frames must be greater than zero")
     device = resolve_device_spec(device, gpu_id)
     checkpoint_dir = resolve_checkpoint(model_path)
     flow, hift = _load_cosyvoice3_flow_hift(
@@ -250,12 +279,18 @@ def create_vocoder_executor(
         fp16=(dtype == "float16"),
     )
 
-    return _CosyVoice3Vocoder(
+    vocoder = _CosyVoice3Vocoder(
         flow,
         hift,
         fp16=(dtype == "float16"),
         flow_batch_bucket_frames=flow_batch_bucket_frames,
-    ).build_scheduler(
+    )
+
+    return SimpleScheduler(
+        vocoder.decode_payload,
+        batch_compute_fn=vocoder.decode_payloads,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
+        request_cost_fn=vocoder._flow_scheduler_cost,
+        max_batch_cost=flow_batch_admission_frames,
     )

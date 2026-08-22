@@ -54,6 +54,7 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
             factory_args={
                 "dtype": "bfloat16",
                 "flow_batch_bucket_frames": 50,
+                "flow_batch_admission_frames": 2000,
             },
             gpu=0,
             terminal=True,

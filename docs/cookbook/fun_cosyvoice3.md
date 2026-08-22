@@ -70,6 +70,13 @@ embedding, pre-lookahead, DiT, and CFM Euler/CFG through the local true-batch ad
 50-frame default matches the current DiT estimator's static chunk size; a larger bucket can
 combine more requests at the cost of additional padding, compute, and peak GPU memory.
 
+The scheduler uses a bucket-rounded Flow admission budget, configured by
+`flow_batch_admission_frames` (2,000 by default). It controls whether a later request joins the
+current Flow batch; it is not a maximum supported request length. A request whose total
+prompt-plus-output mel length exceeds that budget runs as a B=1 Flow batch through the same
+adapter, and later requests wait for the next scheduler batch. This preserves valid long
+generations while preventing them from being combined with more work.
+
 HiFT still runs once per request. The Flow adapter supports the pinned CosyVoice PyTorch
 estimator and buffered `streaming=False, finalize=True` inference only. TensorRT Flow is
 not supported by this integration and fails during vocoder initialization rather than
@@ -83,6 +90,18 @@ sgl-omni serve \
   --config examples/configs/fun_cosyvoice3_0_5b.yaml \
   --port 8000 \
   --stages.vocoder.factory_args.flow_batch_bucket_frames 100
+```
+
+Increase the normal Flow batching budget only after measuring the target GPU. This changes the
+maximum aggregate padded work admitted into one scheduler batch; it does not reject a longer
+single request.
+
+```bash
+sgl-omni serve \
+  --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+  --config examples/configs/fun_cosyvoice3_0_5b.yaml \
+  --port 8000 \
+  --stages.vocoder.factory_args.flow_batch_admission_frames 4000
 ```
 
 The local adapter is tied to the Flow/CFM structure in the documented CosyVoice commit
