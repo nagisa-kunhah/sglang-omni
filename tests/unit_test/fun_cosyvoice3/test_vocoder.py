@@ -12,6 +12,7 @@ from sglang_omni.models.fun_cosyvoice3 import stages
 from sglang_omni.models.fun_cosyvoice3.config import FunCosyVoice3PipelineConfig
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling.messages import IncomingMessage
 
 
 class _FakeHiFT(torch.nn.Module):
@@ -166,6 +167,20 @@ def test_decode_batch_size_one_uses_batch_adapter(monkeypatch) -> None:
     assert len(hift.calls) == 1
 
 
+def test_decode_payload_size_one_uses_batch_adapter(monkeypatch) -> None:
+    flow = _BatchCapableFakeFlow()
+    batch_calls: list[list] = []
+    _install_fake_batch_adapter(monkeypatch, batch_calls)
+    vocoder = stages._CosyVoice3Vocoder(flow, _FakeHiFT())
+    state = _state()
+    state.audio_codes = _codes(2)
+
+    result = asyncio.run(vocoder.decode_payload(_payload(state)))
+
+    assert result.data["modality"] == "audio"
+    assert [len(call) for call in batch_calls] == [1]
+
+
 def test_decode_batch_singleton_buckets_use_batch_adapter(monkeypatch) -> None:
     flow = _BatchCapableFakeFlow()
     hift = _FakeHiFT()
@@ -191,6 +206,18 @@ def test_decode_batch_same_bucket_batches_flow_once(monkeypatch) -> None:
     assert len(batch_calls) == 1
     assert len(batch_calls[0]) == 2
     assert len(hift.calls) == 2
+
+
+def test_decode_batch_long_singleton_uses_batch_adapter(monkeypatch) -> None:
+    flow = _BatchCapableFakeFlow()
+    batch_calls: list[list] = []
+    _install_fake_batch_adapter(monkeypatch, batch_calls)
+    vocoder = stages._CosyVoice3Vocoder(flow, _FakeHiFT())
+
+    asyncio.run(vocoder.decode_batch([(_state(prompt_tokens=0), _codes(2200, 1))]))
+
+    assert [len(call) for call in batch_calls] == [1]
+    assert batch_calls[0][0].token.shape[1] == 2200
 
 
 def test_decode_batch_different_buckets_do_not_share_padding(monkeypatch) -> None:
@@ -288,32 +315,57 @@ def test_vocoder_rejects_non_positive_flow_bucket_size() -> None:
         )
 
 
-def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> None:
-    captured: dict[str, object] = {}
-    sentinel_scheduler = object()
+def test_flow_scheduler_cost_rounds_to_bucket() -> None:
+    vocoder = stages._CosyVoice3Vocoder(
+        _BatchCapableFakeFlow(), _FakeHiFT(), flow_batch_bucket_frames=50
+    )
+    state = _state(prompt_tokens=1)
+    state.audio_codes = _codes(2)
 
-    class FakeVocoder:
-        def __init__(self, flow, hift, **kwargs):
-            captured["flow"] = flow
-            captured["hift"] = hift
-            captured.update(kwargs)
+    assert vocoder._flow_scheduler_cost(_payload(state)) == 50
 
-        def build_scheduler(self, **kwargs):
-            captured.update(
-                {f"scheduler_{key}": value for key, value in kwargs.items()}
-            )
-            return sentinel_scheduler
 
-    fake_flow = object()
-    fake_hift = object()
+def test_flow_admission_defers_request_after_long_singleton(monkeypatch) -> None:
     monkeypatch.setattr(stages, "resolve_device_spec", lambda device, gpu_id: "cpu")
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
     monkeypatch.setattr(
         stages,
         "_load_cosyvoice3_flow_hift",
-        lambda checkpoint_dir, device, fp16: (fake_flow, fake_hift),
+        lambda checkpoint_dir, device, fp16: (_BatchCapableFakeFlow(), _FakeHiFT()),
     )
-    monkeypatch.setattr(stages, "_CosyVoice3Vocoder", FakeVocoder)
+    scheduler = stages.create_vocoder_executor("model", device="cpu")
+    long_state = _state(prompt_tokens=0)
+    long_state.audio_codes = _codes(2200)
+    short_state = _state(prompt_tokens=0)
+    short_state.audio_codes = _codes(2)
+    first = IncomingMessage("long", "new_request", _payload(long_state))
+    second = IncomingMessage("short", "new_request", _payload(short_state))
+    scheduler.inbox.put(second)
+
+    assert scheduler._max_batch_cost == stages._DEFAULT_FLOW_BATCH_ADMISSION_FRAMES
+    assert scheduler._collect_batch(first) == [first]
+    assert scheduler._next_message() == second
+
+
+def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    fake_flow = _BatchCapableFakeFlow()
+    fake_hift = _FakeHiFT()
+    monkeypatch.setattr(stages, "resolve_device_spec", lambda device, gpu_id: "cpu")
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+
+    def fake_load(checkpoint_dir, device, fp16):
+        captured.update(
+            {
+                "checkpoint_dir": checkpoint_dir,
+                "device": device,
+                "fp16": fp16,
+            }
+        )
+        return fake_flow, fake_hift
+
+    monkeypatch.setattr(stages, "_load_cosyvoice3_flow_hift", fake_load)
 
     scheduler = stages.create_vocoder_executor(
         "model",
@@ -322,17 +374,35 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
         max_batch_size=6,
         max_batch_wait_ms=7,
         flow_batch_bucket_frames=100,
+        flow_batch_admission_frames=200,
     )
 
-    assert scheduler is sentinel_scheduler
+    assert isinstance(scheduler, stages.SimpleScheduler)
+    assert scheduler._max_batch_size == 6
+    assert scheduler._max_batch_wait_s == pytest.approx(0.007)
+    assert scheduler._max_batch_cost == 200
+    assert callable(scheduler._request_cost_fn)
+    state = _state(prompt_tokens=1)
+    state.audio_codes = _codes(2)
+    assert scheduler._request_cost_fn(_payload(state)) == 100
     assert captured == {
-        "flow": fake_flow,
-        "hift": fake_hift,
+        "checkpoint_dir": "/checkpoint",
+        "device": "cpu",
         "fp16": True,
-        "flow_batch_bucket_frames": 100,
-        "scheduler_max_batch_size": 6,
-        "scheduler_max_batch_wait_ms": 7,
     }
+
+
+def test_create_vocoder_executor_rejects_non_positive_admission_budget(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(stages, "resolve_device_spec", lambda device, gpu_id: "cpu")
+
+    with pytest.raises(ValueError, match="flow_batch_admission_frames"):
+        stages.create_vocoder_executor(
+            "model",
+            device="cpu",
+            flow_batch_admission_frames=0,
+        )
 
 
 def test_pipeline_config_sets_flow_batch_bucket_by_default() -> None:
@@ -345,4 +415,5 @@ def test_pipeline_config_sets_flow_batch_bucket_by_default() -> None:
     assert vocoder_stage.factory_args == {
         "dtype": "bfloat16",
         "flow_batch_bucket_frames": 50,
+        "flow_batch_admission_frames": 2000,
     }
