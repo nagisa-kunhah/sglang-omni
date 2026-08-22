@@ -35,11 +35,13 @@ class FlowBatchInput:
 class _PackedFlowBatch:
     token: torch.Tensor
     token_mask: torch.Tensor
-    combined_token_lengths: torch.Tensor
-    prompt_token_lengths: torch.Tensor
-    target_token_lengths: torch.Tensor
-    prompt_mel_lengths: torch.Tensor
-    total_mel_lengths: torch.Tensor
+    combined_token_lengths: tuple[int, ...]
+    prompt_token_lengths: tuple[int, ...]
+    target_token_lengths: tuple[int, ...]
+    prompt_mel_lengths: tuple[int, ...]
+    total_mel_lengths: tuple[int, ...]
+    combined_token_lengths_tensor: torch.Tensor
+    total_mel_lengths_tensor: torch.Tensor
     embedding: torch.Tensor
     prompt_feat: tuple[torch.Tensor, ...]
 
@@ -103,29 +105,34 @@ def _pack_flow_inputs(
         _validate_flow_input(flow, item, index)
 
     device, dtype = _flow_device_and_dtype(flow)
-    prompt_token_lengths = torch.tensor(
-        [item.prompt_token.shape[1] for item in inputs],
+    prompt_token_lengths = tuple(int(item.prompt_token.shape[1]) for item in inputs)
+    target_token_lengths = tuple(int(item.token.shape[1]) for item in inputs)
+    combined_token_lengths = tuple(
+        prompt_tokens + target_tokens
+        for prompt_tokens, target_tokens in zip(
+            prompt_token_lengths, target_token_lengths, strict=True
+        )
+    )
+    prompt_mel_lengths = tuple(int(item.prompt_feat.shape[1]) for item in inputs)
+    total_mel_lengths = tuple(
+        token_length * flow.token_mel_ratio for token_length in combined_token_lengths
+    )
+    combined_token_lengths_tensor = torch.tensor(
+        combined_token_lengths,
         dtype=torch.int64,
         device=device,
     )
-    target_token_lengths = torch.tensor(
-        [item.token.shape[1] for item in inputs],
+    total_mel_lengths_tensor = torch.tensor(
+        total_mel_lengths,
         dtype=torch.int64,
         device=device,
     )
-    combined_token_lengths = prompt_token_lengths + target_token_lengths
-    prompt_mel_lengths = torch.tensor(
-        [item.prompt_feat.shape[1] for item in inputs],
-        dtype=torch.int64,
-        device=device,
-    )
-    total_mel_lengths = combined_token_lengths * flow.token_mel_ratio
 
-    max_tokens = int(combined_token_lengths.max().item())
+    max_tokens = max(combined_token_lengths)
     token = torch.zeros(len(inputs), max_tokens, dtype=torch.int32, device=device)
     for index, item in enumerate(inputs):
-        prompt_tokens = int(prompt_token_lengths[index].item())
-        target_tokens = int(target_token_lengths[index].item())
+        prompt_tokens = prompt_token_lengths[index]
+        target_tokens = target_token_lengths[index]
         token[index, :prompt_tokens] = item.prompt_token[0].to(
             device=device, dtype=torch.int32
         )
@@ -135,7 +142,7 @@ def _pack_flow_inputs(
 
     token_mask = (
         torch.arange(max_tokens, device=device).unsqueeze(0)
-        < combined_token_lengths.unsqueeze(1)
+        < combined_token_lengths_tensor.unsqueeze(1)
     ).unsqueeze(-1)
     embedding = torch.cat(
         [item.embedding.to(device=device, dtype=dtype) for item in inputs], dim=0
@@ -151,6 +158,8 @@ def _pack_flow_inputs(
         target_token_lengths=target_token_lengths,
         prompt_mel_lengths=prompt_mel_lengths,
         total_mel_lengths=total_mel_lengths,
+        combined_token_lengths_tensor=combined_token_lengths_tensor,
+        total_mel_lengths_tensor=total_mel_lengths_tensor,
         embedding=embedding,
         prompt_feat=prompt_feat,
     )
@@ -277,7 +286,7 @@ def infer_flow_batch(
         )
     mel_valid = torch.arange(max_mel, device=mu.device).unsqueeze(
         0
-    ) < packed.total_mel_lengths.unsqueeze(1)
+    ) < packed.total_mel_lengths_tensor.unsqueeze(1)
     mask = mel_valid.unsqueeze(1).to(mu.dtype)
     cond = torch.zeros(
         batch_size,
@@ -287,7 +296,7 @@ def infer_flow_batch(
         dtype=mu.dtype,
     )
     for index, prompt_feat in enumerate(packed.prompt_feat):
-        prompt_frames = int(packed.prompt_mel_lengths[index].item())
+        prompt_frames = packed.prompt_mel_lengths[index]
         cond[index, :, :prompt_frames] = prompt_feat[0].transpose(0, 1)
 
     feat = _causal_cfm_forward_batch(
@@ -300,12 +309,10 @@ def infer_flow_batch(
     )
     outputs: list[torch.Tensor] = []
     for index in range(batch_size):
-        start = int(packed.prompt_mel_lengths[index].item())
-        end = int(packed.total_mel_lengths[index].item())
+        start = packed.prompt_mel_lengths[index]
+        end = packed.total_mel_lengths[index]
         mel = feat[index : index + 1, :, start:end]
-        expected_frames = (
-            int(packed.target_token_lengths[index].item()) * flow.token_mel_ratio
-        )
+        expected_frames = packed.target_token_lengths[index] * flow.token_mel_ratio
         expected_shape = (1, flow.output_size, expected_frames)
         if mel.shape != expected_shape:
             raise RuntimeError(
