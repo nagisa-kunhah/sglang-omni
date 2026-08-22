@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, cast
@@ -12,7 +11,6 @@ import torch
 
 from sglang_omni.models.fun_cosyvoice3.flow_batch import (
     FlowBatchInput,
-    flow_batch_unsupported_reason,
     infer_flow_batch,
 )
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
@@ -30,8 +28,6 @@ from sglang_omni.scheduling.vocoder_base import BatchVocoderBase
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 from sglang_omni.utils.checkpoint import resolve_checkpoint
 from sglang_omni.utils.device import resolve_device_spec
-
-logger = logging.getLogger(__name__)
 
 _COSYVOICE_INSTALL_HINT = (
     "Fun-CosyVoice3 support requires the `cosyvoice` package. "
@@ -112,30 +108,19 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         flow: Any,
         hift: Any,
         fp16: bool = False,
-        enable_flow_batch: bool = True,
         flow_batch_bucket_frames: int = 50,
     ) -> None:
         if flow_batch_bucket_frames <= 0:
             raise ValueError("flow_batch_bucket_frames must be greater than zero")
+        if not isinstance(flow.decoder.estimator, torch.nn.Module):
+            raise RuntimeError(
+                "Fun-CosyVoice3 requires the PyTorch Flow estimator from the pinned "
+                "CosyVoice commit; TensorRT Flow is not supported"
+            )
         self._flow = flow
         self._hift = hift
         self._fp16 = fp16
-        self._enable_flow_batch = enable_flow_batch
         self._flow_batch_bucket_frames = flow_batch_bucket_frames
-        self._flow_batch_unsupported_reason = flow_batch_unsupported_reason(flow)
-        if enable_flow_batch and self._flow_batch_unsupported_reason is not None:
-            logger.warning(
-                "Fun-CosyVoice3 Flow batch is unavailable; falling back to upstream "
-                "serial inference: %s",
-                self._flow_batch_unsupported_reason,
-            )
-        logger.info(
-            "Fun-CosyVoice3 Flow batch configuration: requested=%s, supported=%s, "
-            "bucket_frames=%d",
-            enable_flow_batch,
-            self._flow_batch_unsupported_reason is None,
-            flow_batch_bucket_frames,
-        )
 
     def prepare_item(
         self, payload: StagePayload
@@ -162,42 +147,17 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
             for index, (state, codes) in enumerate(items)
         ]
         results: list[tuple[Any, int] | None] = [None] * len(prepared)
-        serial_requests: list[_PreparedFlowRequest] = []
         buckets: dict[int, list[_PreparedFlowRequest]] = defaultdict(list)
         for request in prepared:
-            if self._is_flow_batch_eligible(request.flow_input):
-                buckets[self._flow_bucket_key(request.flow_input)].append(request)
-            else:
-                serial_requests.append(request)
-
-        for request in serial_requests:
-            item = request.flow_input
-            mel = self._token2mel(
-                item.token, item.prompt_token, item.prompt_feat, item.embedding
-            )
-            results[request.index] = (
-                self._mel2wav(mel),
-                request.sample_rate,
-            )
+            buckets[self._flow_bucket_key(request.flow_input)].append(request)
 
         for bucket in buckets.values():
-            if len(bucket) == 1:
-                item = bucket[0].flow_input
-                mel_list = [
-                    self._token2mel(
-                        item.token,
-                        item.prompt_token,
-                        item.prompt_feat,
-                        item.embedding,
-                    )
-                ]
-            else:
-                with torch.autocast(
-                    device_type=current_platform.device_type, enabled=self._fp16
-                ):
-                    mel_list = infer_flow_batch(
-                        self._flow, [request.flow_input for request in bucket]
-                    )
+            with torch.autocast(
+                device_type=current_platform.device_type, enabled=self._fp16
+            ):
+                mel_list = infer_flow_batch(
+                    self._flow, [request.flow_input for request in bucket]
+                )
             for request, mel in zip(bucket, mel_list, strict=True):
                 results[request.index] = (
                     self._mel2wav(mel),
@@ -237,86 +197,12 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
             embedding=embedding,
         )
 
-    def _is_flow_batch_eligible(self, item: FlowBatchInput) -> bool:
-        if (
-            not self._enable_flow_batch
-            or self._flow_batch_unsupported_reason is not None
-        ):
-            return False
-        if item.token.ndim != 2 or item.token.shape[0] != 1 or item.token.shape[1] <= 0:
-            return False
-        if item.prompt_token.ndim != 2 or item.prompt_token.shape[0] != 1:
-            return False
-        if (
-            item.prompt_feat.ndim != 3
-            or item.prompt_feat.shape[0] != 1
-            or item.prompt_feat.shape[2] != self._flow.output_size
-        ):
-            return False
-        if (
-            item.prompt_feat.shape[1]
-            != item.prompt_token.shape[1] * self._flow.token_mel_ratio
-        ):
-            return False
-        if item.embedding.ndim != 2 or item.embedding.shape[0] != 1:
-            return False
-        expected_embedding_size = getattr(
-            self._flow.spk_embed_affine_layer, "in_features", None
-        )
-        return (
-            expected_embedding_size is None
-            or item.embedding.shape[1] == expected_embedding_size
-        )
-
     def _flow_bucket_key(self, item: FlowBatchInput) -> int:
         total_tokens = item.prompt_token.shape[1] + item.token.shape[1]
         total_mel = total_tokens * self._flow.token_mel_ratio
         return (
             total_mel + self._flow_batch_bucket_frames - 1
         ) // self._flow_batch_bucket_frames
-
-    def _token2wav(
-        self,
-        token: torch.Tensor,
-        prompt_token: torch.Tensor,
-        prompt_feat: torch.Tensor,
-        embedding: torch.Tensor,
-    ) -> torch.Tensor:
-        tts_mel = self._token2mel(token, prompt_token, prompt_feat, embedding)
-        return self._mel2wav(tts_mel)
-
-    def _token2mel(
-        self,
-        token: torch.Tensor,
-        prompt_token: torch.Tensor,
-        prompt_feat: torch.Tensor,
-        embedding: torch.Tensor,
-    ) -> torch.Tensor:
-        if token.shape[1] == 0:
-            raise RuntimeError(
-                "Fun-CosyVoice3 generation produced no usable speech tokens"
-            )
-        device = next(self._flow.parameters()).device
-
-        with torch.autocast(
-            device_type=current_platform.device_type, enabled=self._fp16
-        ):
-            tts_mel, _ = self._flow.inference(
-                token=token.to(device, dtype=torch.int32),
-                token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(device),
-                prompt_token=prompt_token.to(device),
-                prompt_token_len=torch.tensor(
-                    [prompt_token.shape[1]], dtype=torch.int32
-                ).to(device),
-                prompt_feat=prompt_feat.to(device),
-                prompt_feat_len=torch.tensor(
-                    [prompt_feat.shape[1]], dtype=torch.int32
-                ).to(device),
-                embedding=embedding.to(device),
-                streaming=False,
-                finalize=True,
-            )
-        return tts_mel
 
     def _mel2wav(self, tts_mel: torch.Tensor) -> torch.Tensor:
         tts_speech, _ = self._hift.inference(speech_feat=tts_mel, finalize=True)
@@ -354,7 +240,6 @@ def create_vocoder_executor(
     dtype: str = "bfloat16",
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
-    enable_flow_batch: bool = True,
     flow_batch_bucket_frames: int = 50,
 ) -> SimpleScheduler:
     device = resolve_device_spec(device, gpu_id)
@@ -369,7 +254,6 @@ def create_vocoder_executor(
         flow,
         hift,
         fp16=(dtype == "float16"),
-        enable_flow_batch=enable_flow_batch,
         flow_batch_bucket_frames=flow_batch_bucket_frames,
     ).build_scheduler(
         max_batch_size=max_batch_size,

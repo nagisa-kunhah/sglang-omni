@@ -17,7 +17,6 @@ import torch.nn.functional as F
 
 __all__ = [
     "FlowBatchInput",
-    "flow_batch_unsupported_reason",
     "infer_flow_batch",
 ]
 
@@ -43,56 +42,6 @@ class _PackedFlowBatch:
     total_mel_lengths: torch.Tensor
     embedding: torch.Tensor
     prompt_feat: tuple[torch.Tensor, ...]
-
-
-def flow_batch_unsupported_reason(flow: Any) -> str | None:
-    """Return why ``flow`` cannot use the local batch adapter, if anything."""
-
-    for name in (
-        "input_embedding",
-        "spk_embed_affine_layer",
-        "pre_lookahead_layer",
-        "token_mel_ratio",
-        "output_size",
-        "decoder",
-    ):
-        if not hasattr(flow, name):
-            return f"Flow is missing required attribute {name!r}"
-
-    ratio = flow.token_mel_ratio
-    if isinstance(ratio, bool) or not isinstance(ratio, int) or ratio <= 0:
-        return "Flow token_mel_ratio must be a positive integer"
-
-    decoder = flow.decoder
-    for name in (
-        "rand_noise",
-        "t_scheduler",
-        "inference_cfg_rate",
-        "forward_estimator",
-        "estimator",
-    ):
-        if not hasattr(decoder, name):
-            return f"Flow decoder is missing required attribute {name!r}"
-
-    if not callable(decoder.forward_estimator):
-        return "Flow decoder forward_estimator must be callable"
-    if not isinstance(decoder.estimator, torch.nn.Module):
-        return (
-            "Flow decoder estimator must be a torch.nn.Module; "
-            "TensorRT estimator pools only support the upstream fixed batch of 2"
-        )
-
-    noise = decoder.rand_noise
-    if not isinstance(noise, torch.Tensor):
-        return "Flow decoder rand_noise must be a torch.Tensor"
-    if noise.ndim != 3 or noise.shape[0] != 1:
-        return "Flow decoder rand_noise must have shape [1, channels, max_frames]"
-    if noise.shape[1] != flow.output_size:
-        return (
-            "Flow decoder rand_noise channel count does not match "
-            f"output_size ({noise.shape[1]} != {flow.output_size})"
-        )
-    return None
 
 
 def _flow_device_and_dtype(flow: Any) -> tuple[torch.device, torch.dtype]:
@@ -309,10 +258,6 @@ def infer_flow_batch(
     inputs: Sequence[FlowBatchInput],
 ) -> list[torch.Tensor]:
     """Infer variable-length CosyVoice3 mel outputs in one true Flow batch."""
-
-    unsupported_reason = flow_batch_unsupported_reason(flow)
-    if unsupported_reason is not None:
-        raise ValueError(f"Flow batch adapter is unsupported: {unsupported_reason}")
 
     packed = _pack_flow_inputs(flow, inputs)
     embedding = F.normalize(packed.embedding, dim=1)
