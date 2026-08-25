@@ -5,10 +5,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang_omni.models.fun_cosyvoice3.flow_batch import (
+from sglang_omni.models.fun_cosyvoice3.stages import (
     FlowBatchInput,
+    FunCosyVoice3Flow,
     _pack_flow_inputs,
-    infer_flow_batch,
 )
 
 
@@ -120,6 +120,10 @@ def _input(
     )
 
 
+def _infer_flow(flow: _FakeFlow, inputs: list[FlowBatchInput]) -> list[torch.Tensor]:
+    return FunCosyVoice3Flow(flow).inference(inputs)
+
+
 def test_pack_flow_inputs_keeps_prompt_and_target_contiguous() -> None:
     flow = _FakeFlow()
     items = [
@@ -167,7 +171,7 @@ def test_flow_batch_builds_variable_length_mel_masks_and_conditions() -> None:
         _input([2, 3], prompt_token=[4, 5], prompt_value=7.0),
     ]
 
-    infer_flow_batch(flow, items)
+    _infer_flow(flow, items)
 
     first = flow.decoder.estimator.calls[0]
     mask = first["mask"][:2]
@@ -184,7 +188,7 @@ def test_flow_batch_builds_variable_length_mel_masks_and_conditions() -> None:
 def test_flow_batch_cfg_uses_two_times_request_batch() -> None:
     flow = _FakeFlow()
 
-    infer_flow_batch(
+    _infer_flow(
         flow,
         [_input([1]), _input([2]), _input([3])],
     )
@@ -206,7 +210,7 @@ def test_flow_batch_cfg_builds_conditional_and_unconditional_halves() -> None:
         _input([3], prompt_token=[4], prompt_value=4.0),
     ]
 
-    infer_flow_batch(flow, items)
+    _infer_flow(flow, items)
 
     first = flow.decoder.estimator.calls[0]
     torch.testing.assert_close(first["x"][:2], first["x"][2:])
@@ -221,11 +225,11 @@ def test_flow_batch_cfg_builds_conditional_and_unconditional_halves() -> None:
 
 def test_flow_batch_reuses_same_noise_prefix_per_request() -> None:
     pair_flow = _FakeFlow()
-    infer_flow_batch(pair_flow, [_input([1, 2]), _input([3, 4])])
+    _infer_flow(pair_flow, [_input([1, 2]), _input([3, 4])])
     pair_noise = pair_flow.decoder.estimator.calls[0]["x"][:2]
 
     single_flow = _FakeFlow()
-    infer_flow_batch(single_flow, [_input([1, 2])])
+    _infer_flow(single_flow, [_input([1, 2])])
     single_noise = single_flow.decoder.estimator.calls[0]["x"][:1]
 
     torch.testing.assert_close(pair_noise[0], pair_noise[1])
@@ -238,8 +242,8 @@ def test_flow_batch_matches_serial_reference_for_mixed_lengths() -> None:
         _input([3], prompt_token=[4, 5], prompt_value=1.5),
         _input([6, 7, 8], prompt_token=[], prompt_value=2.5),
     ]
-    serial = [infer_flow_batch(_FakeFlow(), [item])[0] for item in items]
-    batched = infer_flow_batch(_FakeFlow(), items)
+    serial = [_infer_flow(_FakeFlow(), [item])[0] for item in items]
+    batched = _infer_flow(_FakeFlow(), items)
 
     assert [mel.shape for mel in batched] == [(1, 4, 4), (1, 4, 2), (1, 4, 6)]
     for actual, expected in zip(batched, serial, strict=True):
@@ -251,9 +255,9 @@ def test_flow_batch_crops_each_prompt_independently() -> None:
         _input([1, 2], prompt_token=[3], prompt_value=0.5),
         _input([4, 5], prompt_token=[6, 7, 8], prompt_value=1.5),
     ]
-    serial = [infer_flow_batch(_FakeFlow(), [item])[0] for item in items]
+    serial = [_infer_flow(_FakeFlow(), [item])[0] for item in items]
 
-    batched = infer_flow_batch(_FakeFlow(), items)
+    batched = _infer_flow(_FakeFlow(), items)
 
     for actual, expected in zip(batched, serial, strict=True):
         assert actual.shape[-1] == 4
@@ -264,7 +268,7 @@ def test_flow_batch_rejects_noise_buffer_overflow() -> None:
     flow = _FakeFlow(max_frames=4)
 
     with pytest.raises(ValueError, match="rand_noise.*4.*6"):
-        infer_flow_batch(flow, [_input([1, 2, 3])])
+        _infer_flow(flow, [_input([1, 2, 3])])
 
 
 def test_flow_batch_rejects_prompt_alignment_mismatch() -> None:
@@ -277,4 +281,4 @@ def test_flow_batch_rejects_prompt_alignment_mismatch() -> None:
     )
 
     with pytest.raises(ValueError, match="prompt feature length"):
-        infer_flow_batch(_FakeFlow(), [item])
+        _infer_flow(_FakeFlow(), [item])

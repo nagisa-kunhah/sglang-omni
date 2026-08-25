@@ -63,12 +63,13 @@ sgl-omni serve \
 
 ### Flow Decoder Batching
 
-The buffered vocoder uses one Flow implementation for every request. `SimpleScheduler`
-collects up to 8 requests for at most 2 ms, then the vocoder groups requests by total mel
-length in 50-frame buckets. Every bucket, including a single-request bucket, runs token
-embedding, pre-lookahead, DiT, and CFM Euler/CFG through the local true-batch adapter. The
-50-frame default matches the current DiT estimator's static chunk size; a larger bucket can
-combine more requests at the cost of additional padding, compute, and peak GPU memory.
+The buffered vocoder uses the batch-capable `FunCosyVoice3Flow.inference` API for every
+request. `SimpleScheduler` collects up to 8 requests for at most 2 ms, then the vocoder
+groups requests by total mel length in 50-frame buckets. Every bucket, including a
+single-request bucket, calls the same built-in Flow inference method; packing, padding,
+masking, CFM Euler/CFG, and output unpadding are handled inside the Flow implementation.
+The 50-frame default matches the current DiT estimator's static chunk size; a larger bucket
+can combine more requests at the cost of additional padding, compute, and peak GPU memory.
 
 The scheduler uses a bucket-rounded Flow admission budget, configured by
 `flow_batch_admission_frames` (2,000 by default). It controls whether a later request joins the
@@ -77,10 +78,10 @@ prompt-plus-output mel length exceeds that budget runs as a B=1 Flow batch throu
 adapter, and later requests wait for the next scheduler batch. This preserves valid long
 generations while preventing them from being combined with more work.
 
-HiFT still runs once per request. The Flow adapter supports the pinned CosyVoice PyTorch
-estimator and buffered `streaming=False, finalize=True` inference only. TensorRT Flow is
-not supported by this integration and fails during vocoder initialization rather than
-falling back to another inference path.
+HiFT still runs once per request. The built-in Flow implementation supports the pinned
+CosyVoice PyTorch estimator and buffered `streaming=False, finalize=True` inference only.
+TensorRT Flow is not supported by this integration and fails during vocoder initialization
+rather than falling back to another inference path.
 
 Change the mel-frame bucket size, for example to 100 frames:
 
@@ -104,7 +105,7 @@ sgl-omni serve \
   --stages.vocoder.factory_args.flow_batch_admission_frames 4000
 ```
 
-The local adapter is tied to the Flow/CFM structure in the documented CosyVoice commit
+The built-in Flow implementation is tied to the Flow/CFM structure in the documented CosyVoice commit
 `074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc`. It does not modify or monkey-patch the
 CosyVoice checkout; an incompatible Flow structure fails directly instead of using a
 fallback implementation.

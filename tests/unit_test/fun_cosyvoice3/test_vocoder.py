@@ -150,7 +150,7 @@ def _install_fake_batch_adapter(monkeypatch, calls: list[list]) -> None:
             for item in inputs
         ]
 
-    monkeypatch.setattr(stages, "infer_flow_batch", fake_infer)
+    monkeypatch.setattr(stages.FunCosyVoice3Flow, "inference", fake_infer)
 
 
 def test_decode_batch_size_one_uses_batch_adapter(monkeypatch) -> None:
@@ -300,7 +300,7 @@ def test_decode_batch_does_not_retry_after_batch_failure(monkeypatch) -> None:
         del flow, inputs
         raise RuntimeError("batch estimator failed")
 
-    monkeypatch.setattr(stages, "infer_flow_batch", fail_batch)
+    monkeypatch.setattr(stages.FunCosyVoice3Flow, "inference", fail_batch)
 
     with pytest.raises(RuntimeError, match="batch estimator failed"):
         asyncio.run(
