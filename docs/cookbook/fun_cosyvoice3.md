@@ -90,7 +90,17 @@ sgl-omni serve \
   --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
   --config examples/configs/fun_cosyvoice3_0_5b.yaml \
   --port 8000 \
-  --stages.vocoder.factory_args.flow_batch_bucket_frames 100
+  --vocoder.factory.flow_batch_bucket_frames 100
+```
+
+The same setting can be written in the pipeline config under the vocoder's
+`factory` group:
+
+```yaml
+stages:
+  vocoder:
+    factory:
+      flow_batch_bucket_frames: 100
 ```
 
 Increase the normal Flow batching budget only after measuring the target GPU. This changes the
@@ -102,7 +112,16 @@ sgl-omni serve \
   --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
   --config examples/configs/fun_cosyvoice3_0_5b.yaml \
   --port 8000 \
-  --stages.vocoder.factory_args.flow_batch_admission_frames 4000
+  --vocoder.factory.flow_batch_admission_frames 4000
+```
+
+The YAML equivalent is:
+
+```yaml
+stages:
+  vocoder:
+    factory:
+      flow_batch_admission_frames: 4000
 ```
 
 The built-in Flow implementation is tied to the Flow/CFM structure in the documented CosyVoice commit
