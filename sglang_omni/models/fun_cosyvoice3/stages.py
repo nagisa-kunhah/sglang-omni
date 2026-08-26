@@ -74,11 +74,17 @@ def _validate_flow_input(flow: Any, item: FlowBatchInput, index: int) -> None:
     if item.token.ndim != 2 or item.token.shape[0] != 1 or item.token.shape[1] <= 0:
         raise ValueError(f"input {index} token must have shape [1, target_tokens]")
     if item.prompt_token.ndim != 2 or item.prompt_token.shape[0] != 1:
-        raise ValueError(f"input {index} prompt_token must have shape [1, prompt_tokens]")
+        raise ValueError(
+            f"input {index} prompt_token must have shape [1, prompt_tokens]"
+        )
     if item.prompt_feat.ndim != 3 or item.prompt_feat.shape[0] != 1:
-        raise ValueError(f"input {index} prompt_feat must have shape [1, prompt_frames, channels]")
+        raise ValueError(
+            f"input {index} prompt_feat must have shape [1, prompt_frames, channels]"
+        )
     if item.prompt_feat.shape[2] != flow.output_size:
-        raise ValueError(f"input {index} prompt feature width must equal Flow output_size")
+        raise ValueError(
+            f"input {index} prompt feature width must equal Flow output_size"
+        )
     expected_frames = item.prompt_token.shape[1] * flow.token_mel_ratio
     if item.prompt_feat.shape[1] != expected_frames:
         raise ValueError(
@@ -88,8 +94,13 @@ def _validate_flow_input(flow: Any, item: FlowBatchInput, index: int) -> None:
     if item.embedding.ndim != 2 or item.embedding.shape[0] != 1:
         raise ValueError(f"input {index} embedding must have shape [1, speaker_dim]")
     expected_embedding_size = getattr(flow.spk_embed_affine_layer, "in_features", None)
-    if expected_embedding_size is not None and item.embedding.shape[1] != expected_embedding_size:
-        raise ValueError(f"input {index} embedding width must be {expected_embedding_size}")
+    if (
+        expected_embedding_size is not None
+        and item.embedding.shape[1] != expected_embedding_size
+    ):
+        raise ValueError(
+            f"input {index} embedding width must be {expected_embedding_size}"
+        )
 
 
 def _pack_flow_inputs(flow: Any, inputs: Sequence[FlowBatchInput]) -> _PackedFlowBatch:
@@ -213,9 +224,13 @@ def _generate_flow(flow: Any, packed: _PackedFlowBatch) -> torch.Tensor:
     if channels != flow.output_size:
         raise ValueError("Flow pre-lookahead output width does not match output_size")
     mask = (
-        torch.arange(max_mel, device=mu.device).unsqueeze(0)
-        < packed.total_mel_lengths_tensor.unsqueeze(1)
-    ).unsqueeze(1).to(mu.dtype)
+        (
+            torch.arange(max_mel, device=mu.device).unsqueeze(0)
+            < packed.total_mel_lengths_tensor.unsqueeze(1)
+        )
+        .unsqueeze(1)
+        .to(mu.dtype)
+    )
     cond = torch.zeros_like(mu)
     for index, prompt_frames in enumerate(packed.prompt_mel_lengths):
         cond[index, :, :prompt_frames] = packed.prompt_feat[
@@ -270,7 +285,9 @@ class FunCosyVoice3Flow:
                 :,
                 prompt_frames : packed.total_mel_lengths[index],
             ]
-            expected_frames = packed.target_token_lengths[index] * self._flow.token_mel_ratio
+            expected_frames = (
+                packed.target_token_lengths[index] * self._flow.token_mel_ratio
+            )
             if mel.shape != (1, self._flow.output_size, expected_frames):
                 raise RuntimeError(
                     f"Flow output {index} has unexpected shape {tuple(mel.shape)}"
@@ -360,7 +377,9 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
                 "Fun-CosyVoice3 requires the PyTorch Flow estimator from the pinned "
                 "CosyVoice commit; TensorRT Flow is not supported"
             )
-        self._flow = flow if isinstance(flow, FunCosyVoice3Flow) else FunCosyVoice3Flow(flow)
+        self._flow = (
+            flow if isinstance(flow, FunCosyVoice3Flow) else FunCosyVoice3Flow(flow)
+        )
         self._hift = hift
         self._fp16 = fp16
         self._flow_batch_bucket_frames = flow_batch_bucket_frames

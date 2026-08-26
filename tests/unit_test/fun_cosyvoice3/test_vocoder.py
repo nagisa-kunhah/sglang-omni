@@ -412,7 +412,7 @@ def test_pipeline_config_sets_flow_batch_bucket_by_default() -> None:
         if stage.name == "vocoder"
     )
 
-    assert vocoder_stage.factory_args == {
+    assert vocoder_stage.factory.model_dump(exclude_none=True) == {
         "dtype": "bfloat16",
         "flow_batch_bucket_frames": 50,
         "flow_batch_admission_frames": 2000,
