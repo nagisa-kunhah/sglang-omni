@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import torch
 
+from sglang_omni.config.manager import ConfigManager
+from sglang_omni.config.runtime import resolve_stage_typed_kwargs
 from sglang_omni.models.fun_cosyvoice3 import CAPABILITIES
 from sglang_omni.models.fun_cosyvoice3.config import FunCosyVoice3PipelineConfig
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
-from sglang_omni.config.manager import ConfigManager
-from sglang_omni.config.runtime import resolve_stage_typed_kwargs
 from tests.unit_test.pipeline.helpers import build_compiled_process_topology
 
 
