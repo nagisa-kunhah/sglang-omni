@@ -26,9 +26,9 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 from sglang_omni.utils.checkpoint import resolve_checkpoint
 from sglang_omni.utils.device import resolve_device_spec
 
-# This is an admission budget, not a maximum supported request length. The
-# scheduler admits a request that exceeds it as a singleton Flow batch and
-# defers following requests to the next batch.
+# Note (xinran): This is an admission budget, not a maximum supported request
+# length. The scheduler admits a request that exceeds it as a singleton Flow
+# batch and defers following requests to the next batch.
 _DEFAULT_FLOW_BATCH_ADMISSION_FRAMES = 2000
 
 _COSYVOICE_INSTALL_HINT = (
