@@ -10,6 +10,7 @@ from sglang_omni.model_runner.prefill_inputs import (
 )
 from sglang_omni.models.nemotron_voicechat.talker import GraphCodeGenerator
 from sglang_omni.platforms import current_platform
+from sglang_omni.scheduling.generation_batch_policy import build_default_cuda_graph_bs
 
 NUM_ITER = 8
 
@@ -56,6 +57,7 @@ class NemotronVoiceChatTalkerModelRunner(ModelRunner):
                 self.model.talker,
                 self.model.mog_head,
                 backend=backend,
+                buckets=build_default_cuda_graph_bs(self.model.hidden_out.shape[0]),
                 level_schedule=self.level_schedule,
                 top_p=self.top_p,
                 noise_scale=self.noise_scale,
@@ -200,14 +202,14 @@ class NemotronVoiceChatTalkerModelRunner(ModelRunner):
         model.fusion_buffer[:batch] = torch.cat(rows, dim=0)
         model.fusion_mask[:batch] = True
 
-    def generate_codes(self, index: int) -> torch.Tensor:
+    def generate_codes(self, batch: int) -> torch.Tensor:
         model = self.model
         if self.graph_code_generator is not None:
-            return self.graph_code_generator(model.hidden_out[index : index + 1])
+            return self.graph_code_generator(model.hidden_out[:batch])
         else:
             pass
         return model.talker.generate_codes(
-            model.hidden_out[index : index + 1].float(),
+            model.hidden_out[:batch].float(),
             model.mog_head,
             level_schedule=self.level_schedule,
             top_p=self.top_p,
@@ -216,9 +218,10 @@ class NemotronVoiceChatTalkerModelRunner(ModelRunner):
 
     def post_decode(self, result, forward_batch, schedule_batch, requests) -> None:
         del result, forward_batch, schedule_batch
-        for index, request in enumerate(requests):
+        codes_BQ = self.generate_codes(len(requests))
+        for row, request in enumerate(requests):
             inputs = request.data.talker_model_inputs
-            codes = self.generate_codes(index)
+            codes = codes_BQ[row : row + 1]
             inputs["prev_codes"] = codes
             inputs["codes_rows"].append(codes[0])
             inputs["stream_chunk"] = codes.cpu()

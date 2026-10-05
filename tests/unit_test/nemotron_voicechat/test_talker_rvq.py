@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Talker RVQ code generation runs on a schedule precomputed at load time."""
+"""Talker RVQ code generation: level schedule, batching and graph replay."""
 
 import pytest
 import torch
@@ -16,6 +16,7 @@ CODEBOOK_SIZE = 16
 HIDDEN_SIZE = 32
 LATENT_SIZE = 8
 TOP_P = 0.9
+BUCKETS = [1, 2, 4]
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 
@@ -97,12 +98,36 @@ def test_generate_codes_does_not_sync_with_host():
     assert int(codes_TQ.max()) < CODEBOOK_SIZE
 
 
+@pytest.mark.parametrize("device", DEVICES)
+def test_batched_rows_do_not_depend_on_other_rows(device):
+    device = torch.device(device)
+    talker = make_talker().to(device)
+    mog_head = make_mog_head().to(device)
+    level_schedule = talker.build_level_schedule(8, 2.0, device)
+    hidden_BD = torch.randn(4, HIDDEN_SIZE, device=device)
+    neighbours_BD = hidden_BD.clone()
+    neighbours_BD[1::2] = torch.randn(2, HIDDEN_SIZE, device=device)
+
+    codes_BQ = []
+    for hidden in (hidden_BD, neighbours_BD):
+        torch.manual_seed(7)
+        codes_BQ.append(
+            talker.generate_codes(
+                hidden, mog_head, level_schedule=level_schedule, top_p=TOP_P
+            )
+        )
+
+    assert torch.equal(codes_BQ[0][0::2], codes_BQ[1][0::2])
+    assert not torch.equal(codes_BQ[0][1::2], codes_BQ[1][1::2])
+
+
 def make_graph_code_generator(talker, mog_head, level_schedule):
     device = torch.device("cuda")
     return GraphCodeGenerator(
         talker,
         mog_head,
         backend=current_platform.get_device_graph_backend(device),
+        buckets=BUCKETS,
         level_schedule=level_schedule,
         top_p=TOP_P,
         noise_scale=1.0,
@@ -110,42 +135,52 @@ def make_graph_code_generator(talker, mog_head, level_schedule):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_graph_codes_match_eager_step_for_step():
+def test_graph_codes_match_padded_eager_step_for_step():
     device = torch.device("cuda")
     talker = make_talker().to(device)
     mog_head = make_mog_head().to(device)
     level_schedule = talker.build_level_schedule(8, 2.0, device)
     graph_code_generator = make_graph_code_generator(talker, mog_head, level_schedule)
-    hidden_steps = [torch.randn(1, HIDDEN_SIZE, device=device) for _ in range(5)]
+    hidden_steps = [
+        torch.randn(rows, HIDDEN_SIZE, device=device) for rows in (1, 3, 2, 4, 1)
+    ]
 
     torch.manual_seed(7)
     with torch.inference_mode():
-        eager_steps = [
-            talker.generate_codes(
-                hidden_TD, mog_head, level_schedule=level_schedule, top_p=TOP_P
+        eager_steps = []
+        for hidden_BD in hidden_steps:
+            bucket = min(size for size in BUCKETS if size >= hidden_BD.shape[0])
+            padded_BD = torch.zeros(bucket, HIDDEN_SIZE, device=device)
+            padded_BD[: hidden_BD.shape[0]] = hidden_BD
+            eager_steps.append(
+                talker.generate_codes(
+                    padded_BD, mog_head, level_schedule=level_schedule, top_p=TOP_P
+                )
             )
-            for hidden_TD in hidden_steps
-        ]
     torch.manual_seed(7)
-    graph_steps = [graph_code_generator(hidden_TD) for hidden_TD in hidden_steps]
+    graph_steps = [graph_code_generator(hidden_BD) for hidden_BD in hidden_steps]
 
-    for eager_codes, graph_codes in zip(eager_steps, graph_steps, strict=True):
-        assert torch.equal(eager_codes, graph_codes)
+    for hidden_BD, eager_codes, graph_codes in zip(
+        hidden_steps, eager_steps, graph_steps, strict=True
+    ):
+        assert graph_codes.shape == (hidden_BD.shape[0], NUM_QUANTIZERS)
+        assert torch.equal(eager_codes[: hidden_BD.shape[0]], graph_codes)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_graph_replays_draw_fresh_noise():
+def test_graph_replays_draw_fresh_noise_for_every_row():
     device = torch.device("cuda")
     talker = make_talker().to(device)
     mog_head = make_mog_head().to(device)
     graph_code_generator = make_graph_code_generator(
         talker, mog_head, talker.build_level_schedule(8, 2.0, device)
     )
-    hidden_TD = torch.randn(1, HIDDEN_SIZE, device=device)
+    hidden_BD = torch.randn(1, HIDDEN_SIZE, device=device).expand(4, -1)
 
-    replays = [graph_code_generator(hidden_TD) for _ in range(8)]
+    replays = [graph_code_generator(hidden_BD) for _ in range(8)]
 
-    assert any(not torch.equal(replays[0], codes) for codes in replays[1:])
+    assert any(not torch.equal(replays[0], codes_BQ) for codes_BQ in replays[1:])
+    assert any(not torch.equal(replays[0][0], row) for row in replays[0][1:])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -156,13 +191,13 @@ def test_graph_replay_does_not_sync_with_host():
     graph_code_generator = make_graph_code_generator(
         talker, mog_head, talker.build_level_schedule(8, 2.0, device)
     )
-    hidden_TD = torch.randn(1, HIDDEN_SIZE, device=device)
+    hidden_BD = torch.randn(3, HIDDEN_SIZE, device=device)
 
     torch.cuda.set_sync_debug_mode("error")
     try:
-        codes_TQ = graph_code_generator(hidden_TD)
+        codes_BQ = graph_code_generator(hidden_BD)
     finally:
         torch.cuda.set_sync_debug_mode("default")
 
-    assert codes_TQ.shape == (1, NUM_QUANTIZERS)
-    assert not codes_TQ.is_inference()
+    assert codes_BQ.shape == (3, NUM_QUANTIZERS)
+    assert not codes_BQ.is_inference()
