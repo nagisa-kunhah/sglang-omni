@@ -203,6 +203,10 @@ class NemotronVoiceChatTalkerModelRunner(ModelRunner):
         model.fusion_mask[:batch] = True
 
     def generate_codes(self, batch: int) -> torch.Tensor:
+        """Use global RNG reproducibly for a fixed seed and batch schedule.
+
+        Request order, batch composition, and graph padding can change draws.
+        """
         model = self.model
         if self.graph_code_generator is not None:
             return self.graph_code_generator(model.hidden_out[:batch])
@@ -219,9 +223,10 @@ class NemotronVoiceChatTalkerModelRunner(ModelRunner):
     def post_decode(self, result, forward_batch, schedule_batch, requests) -> None:
         del result, forward_batch, schedule_batch
         codes_BQ = self.generate_codes(len(requests))
+        host_codes = codes_BQ.cpu()
         for row, request in enumerate(requests):
             inputs = request.data.talker_model_inputs
             codes = codes_BQ[row : row + 1]
             inputs["prev_codes"] = codes
             inputs["codes_rows"].append(codes[0])
-            inputs["stream_chunk"] = codes.cpu()
+            inputs["stream_chunk"] = host_codes[row : row + 1]

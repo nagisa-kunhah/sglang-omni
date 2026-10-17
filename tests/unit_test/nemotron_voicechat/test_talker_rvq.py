@@ -201,3 +201,32 @@ def test_graph_replay_does_not_sync_with_host():
 
     assert codes_BQ.shape == (3, NUM_QUANTIZERS)
     assert not codes_BQ.is_inference()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_batch_composition_preserves_codes_with_request_owned_draws(
+    device, monkeypatch
+):
+    """Couple draws by request to distinguish batching from global RNG ordering."""
+    torch.manual_seed(31)
+    device = torch.device(device)
+    talker = make_talker().to(device)
+    mog_head = make_mog_head().to(device)
+    schedule = talker.build_level_schedule(8, 2.0, device)
+    hidden = torch.randn(4, HIDDEN_SIZE, device=device)
+    uniforms = [torch.rand(4, CODEBOOK_SIZE, device=device) for _ in schedule]
+    normals = [torch.randn(4, LATENT_SIZE, device=device) for _ in schedule]
+
+    def generate(rows):
+        uniform_iter = iter([draw[rows] for draw in uniforms])
+        normal_iter = iter([draw[rows] for draw in normals])
+        monkeypatch.setattr(torch, "rand_like", lambda tensor: next(uniform_iter))
+        monkeypatch.setattr(torch, "randn_like", lambda tensor: next(normal_iter))
+        return talker.generate_codes(
+            hidden[rows], mog_head, level_schedule=schedule, top_p=TOP_P
+        )
+
+    with torch.inference_mode():
+        reference = torch.cat([generate([row]) for row in range(4)])
+        for rows in ([0, 1, 2, 3], [3, 0, 2], [2, 0], [1]):
+            assert torch.equal(generate(rows), reference[rows])
