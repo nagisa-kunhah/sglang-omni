@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.runtime_context import get_schedule
@@ -107,6 +109,11 @@ def build_char_encoder(config: dict) -> nn.Module:
     return model
 
 
+class LevelScheduleEntry(NamedTuple):
+    first_level: int
+    level_count: int
+
+
 class EarTtsTalker(nn.Module):
     def __init__(self, config: dict) -> None:
         super().__init__()
@@ -144,21 +151,23 @@ class EarTtsTalker(nn.Module):
 
     def build_level_schedule(
         self, num_iter: int, exponent: float, device: torch.device
-    ) -> list[tuple[int, int]]:
-        """(first_level, level_count) per sampling iteration, empty ones dropped."""
+    ) -> list[LevelScheduleEntry]:
+        """Quantizer levels per nonempty sampling iteration."""
         # Same ops on the runtime device, so ceil lands on the same level counts.
         rates = torch.linspace(0.0, 1.0, num_iter + 1, device=device)[:-1]
         masking = (1.0 - rates.pow(exponent)).pow(1.0 / exponent)
         counts = torch.ceil(masking * self.num_quantizers).long()
         counts = counts - torch.cat([counts[1:], counts.new_zeros(1)])
-        level_schedule = []
+        level_schedule: list[LevelScheduleEntry] = []
         first_level = 0
-        for count in counts.tolist():
-            if count > 0:
-                level_schedule.append((first_level, count))
+        for level_count in counts.tolist():
+            if level_count > 0:
+                level_schedule.append(
+                    LevelScheduleEntry(first_level=first_level, level_count=level_count)
+                )
             else:
                 pass
-            first_level += count
+            first_level += level_count
         return level_schedule
 
     def generate_codes(
@@ -166,7 +175,7 @@ class EarTtsTalker(nn.Module):
         hidden_TD,
         mog_head,
         *,
-        level_schedule: list[tuple[int, int]],
+        level_schedule: list[LevelScheduleEntry],
         top_p: float | None = None,
         noise_scale: float = 1.0,
         guidance_scale: float = 0.0,
@@ -179,8 +188,10 @@ class EarTtsTalker(nn.Module):
         codes_TQ = torch.zeros(
             frames, self.num_quantizers, dtype=torch.long, device=hidden_TD.device
         )
-        for first_level, count in level_schedule:
-            depth_TD = self.embed_code(self.depth_sum(codes_TQ, first_level))
+        for schedule_entry in level_schedule:
+            depth_TD = self.embed_code(
+                self.depth_sum(codes_TQ, schedule_entry.first_level)
+            )
             fed_TD = depth_TD + hidden_TD
             if guidance_scale > 0:
                 fed_TD = torch.cat([fed_TD, depth_TD + uncond_TD])
@@ -193,7 +204,12 @@ class EarTtsTalker(nn.Module):
                 mean_TD
                 + torch.exp(log_std_T1) * torch.randn_like(mean_TD) * noise_scale
             )
-            codes_TQ = self.quantise(sampled_TD, codes_TQ, first_level, count)
+            codes_TQ = self.quantise(
+                sampled_TD,
+                codes_TQ,
+                schedule_entry.first_level,
+                schedule_entry.level_count,
+            )
         return codes_TQ
 
     def depth_sum(self, codes_TQ, levels: int):
