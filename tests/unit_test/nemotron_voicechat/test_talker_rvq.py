@@ -11,7 +11,6 @@ NUM_QUANTIZERS = 31
 CODEBOOK_SIZE = 16
 HIDDEN_SIZE = 32
 LATENT_SIZE = 8
-DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 
 def make_talker() -> EarTtsTalker:
@@ -54,10 +53,16 @@ def make_mog_head() -> MoGHead:
     return mog_head
 
 
-@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.accelerator)]
+)
 @pytest.mark.parametrize("num_iter", [1, 4, 8, 40])
 @pytest.mark.parametrize("exponent", [0.5, 1.0, 2.0, 3.0])
 def test_level_schedule_assigns_every_quantizer_once(device, num_iter, exponent):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    else:
+        pass
     level_schedule = make_talker().build_level_schedule(
         num_iter, exponent, torch.device(device)
     )
@@ -71,8 +76,12 @@ def test_level_schedule_assigns_every_quantizer_once(device, num_iter, exponent)
     assert next_level == NUM_QUANTIZERS
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.accelerator
 def test_generate_codes_does_not_sync_with_host():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    else:
+        pass
     device = torch.device("cuda")
     talker = make_talker().to(device)
     mog_head = make_mog_head().to(device)
