@@ -5,17 +5,12 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
-import gc
-import logging
-import time
 from dataclasses import dataclass
 
 import torch
-from sglang.srt.utils.common import get_available_gpu_memory
 
-from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
+from sglang_omni.models.fun_cosyvoice3.packed_dit import CONV_CONTEXT_FRAMES, PackedDiT
 from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
-    CONV_CONTEXT_FRAMES,
     PrefixCacheRow,
     PrefixKVPool,
     PrefixRowAttention,
@@ -23,11 +18,8 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
     forward_prefix,
     run_prefix_solve,
 )
-from sglang_omni.platforms.device_graph import DeviceGraphBackend, ReplayableGraph
-
-logger = logging.getLogger(__name__)
-
-CAPTURE_WARMUP_RUNS = 2
+from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import SolveGraphCapture
+from sglang_omni.platforms.device_graph import ReplayableGraph
 
 
 @dataclass(kw_only=True)
@@ -51,8 +43,7 @@ class PrefixCudaGraphRunner:
         estimator: PackedDiT,
         pool: PrefixKVPool,
         *,
-        backend: DeviceGraphBackend,
-        autocast_dtype: torch.dtype,
+        graphs: SolveGraphCapture,
         frame_dtype: torch.dtype,
         speaker_dtype: torch.dtype,
         cfg_rate: float,
@@ -65,26 +56,27 @@ class PrefixCudaGraphRunner:
     ) -> None:
         self.estimator = estimator
         self.pool = pool
-        self.backend = backend
+        self.graphs = graphs
         self.device = pool.device
-        self.device_module = torch.get_device_module(pool.device)
-        self.autocast_dtype = autocast_dtype
         self.frame_dtype = frame_dtype
         self.speaker_dtype = speaker_dtype
         self.cfg_rate = cfg_rate
         self.euler_steps = len(pool.keys)
         self.mel_channels = mel_channels
         self.speaker_channels = speaker_channels
-        row_ladder = sorted(
-            {
-                rows
-                for rows in (1, 2, 4, 8, 12, *range(16, max_rows + 1, 8))
-                if rows <= max_rows
-            }
-            | {max_rows}
-        )
-        self.tier_frames = [rows * hop_frames for rows in row_ladder]
+        # note (ratish): a tier at every whole chunk from the shortest hop to max_rows
+        # longest hops. Rows commit whole chunks and prompts pad to a hop, so at the
+        # default hop a step is whole chunks; the prefill ladder padded it 6 %.
         chunk_size = estimator.chunk_size
+        top_frames = max_rows * hop_frames
+        self.tier_frames = [
+            *(
+                frames
+                for frames in range(chunk_size, top_frames, chunk_size)
+                if frames >= min_hop_frames
+            ),
+            top_frames,
+        ]
         self.layouts: list[PrefixStepLayout] = []
         for frames in self.tier_frames:
             row_slots = min(max_rows, frames // min_hop_frames)
@@ -98,24 +90,48 @@ class PrefixCudaGraphRunner:
                     page_table_width=max_frames,
                 )
             )
-        angles, scale = estimator.dit.rotary_embed.forward_from_seq_len(max_frames)
-        assert not isinstance(scale, torch.Tensor), "the DiT's RoPE has no xpos scale"
-        self.angles = angles
+        self.angles = estimator.rope_angles(max_frames)
         self.captured: list[CapturedPrefixSolve] = []
 
     @torch.inference_mode()
     def capture(self) -> None:
-        """Largest tier first, so the smaller ones reuse its pool memory."""
-        started = time.perf_counter()
-        before_mem = get_available_gpu_memory(self.device.type, self.device.index)
-        graph_pool = self.backend.graph_pool_handle()
-        stream = self.device_module.Stream(device=self.device)
+        """Largest tier first, so the smaller ones reuse its pool memory. Every tier
+        captures over views of one set of input buffers at the largest tier's size."""
         hidden_size = self.estimator.dit.input_embed.proj.out_features
-        # note(ratish): a collection during capture can free what a reference cycle holds,
-        # an onnxruntime session among them, and invalidate the graph.
-        gc.collect()
-        gc.freeze()
-        try:
+        # note (ratish): replays run one at a time on the vocoder's stream, each copying
+        # its inputs in and its outputs out, so the tiers can share their inputs; a set
+        # per tier held 1.7 GB of contexts over the prefill ladder's tiers.
+        top_tier_frames = max(layout.half_frames for layout in self.layouts)
+        max_row_slots = max(layout.row_slots for layout in self.layouts)
+        noise_buffer = torch.zeros(
+            1,
+            top_tier_frames,
+            self.mel_channels,
+            device=self.device,
+            dtype=self.frame_dtype,
+        )
+        mu_buffer = torch.zeros_like(noise_buffer)
+        mel_conditioning_buffer = torch.zeros_like(noise_buffer)
+        time_span = torch.zeros(
+            self.euler_steps + 1, device=self.device, dtype=self.frame_dtype
+        )
+        speaker_buffer = torch.zeros(
+            max_row_slots,
+            self.speaker_channels,
+            device=self.device,
+            dtype=self.speaker_dtype,
+        )
+        context_buffer = torch.zeros(
+            self.euler_steps,
+            2 * max_row_slots,
+            2,
+            CONV_CONTEXT_FRAMES,
+            hidden_size,
+            device=self.device,
+            dtype=self.speaker_dtype,
+        )
+        next_context_buffer = torch.empty_like(context_buffer)
+        with self.graphs.capture_session("prefix", self.tier_frames):
             for layout in reversed(self.layouts):
                 attention = PrefixRowAttention(
                     rows=[],
@@ -129,34 +145,12 @@ class PrefixCudaGraphRunner:
                     attention.mark_dynamic()
                 else:
                     pass
-                noise = torch.zeros(
-                    1,
-                    layout.half_frames,
-                    self.mel_channels,
-                    device=self.device,
-                    dtype=self.frame_dtype,
-                )
-                time_span = torch.zeros(
-                    self.euler_steps + 1, device=self.device, dtype=self.frame_dtype
-                )
-                mu = torch.zeros_like(noise)
-                speaker_embeddings = torch.zeros(
-                    layout.row_slots,
-                    self.speaker_channels,
-                    device=self.device,
-                    dtype=self.speaker_dtype,
-                )
-                mel_conditioning = torch.zeros_like(noise)
-                context = torch.zeros(
-                    self.euler_steps,
-                    2 * layout.row_slots,
-                    2,
-                    CONV_CONTEXT_FRAMES,
-                    hidden_size,
-                    device=self.device,
-                    dtype=self.speaker_dtype,
-                )
-                next_context = torch.empty_like(context)
+                noise = noise_buffer[:, : layout.half_frames]
+                mu = mu_buffer[:, : layout.half_frames]
+                mel_conditioning = mel_conditioning_buffer[:, : layout.half_frames]
+                speaker_embeddings = speaker_buffer[: layout.row_slots]
+                context = context_buffer[:, : 2 * layout.row_slots]
+                next_context = next_context_buffer[:, : 2 * layout.row_slots]
 
                 def solve() -> torch.Tensor:
                     return run_prefix_solve(
@@ -174,27 +168,7 @@ class PrefixCudaGraphRunner:
                         cfg_rate=self.cfg_rate,
                     )
 
-                stream.wait_stream(self.device_module.current_stream(self.device))
-                with (
-                    self.device_module.stream(stream),
-                    torch.autocast(
-                        device_type=self.device.type, dtype=self.autocast_dtype
-                    ),
-                ):
-                    for _ in range(CAPTURE_WARMUP_RUNS):
-                        solve()
-                self.device_module.current_stream(self.device).wait_stream(stream)
-                self.device_module.synchronize(self.device)
-                with (
-                    self.backend.capture(
-                        pool=graph_pool, stream=stream, thread_local_errors=True
-                    ) as graph,
-                    torch.autocast(
-                        device_type=self.device.type, dtype=self.autocast_dtype
-                    ),
-                ):
-                    output = solve()
-                self.device_module.synchronize(self.device)
+                graph, output = self.graphs.capture(solve)
                 self.captured.append(
                     CapturedPrefixSolve(
                         layout=layout,
@@ -210,16 +184,7 @@ class PrefixCudaGraphRunner:
                         output=output,
                     )
                 )
-        finally:
-            gc.unfreeze()
-            gc.collect()
         self.captured.reverse()
-        after_mem = get_available_gpu_memory(self.device.type, self.device.index)
-        logger.info(
-            f"Fun-CosyVoice3 prefix solve graphs captured: tiers={self.tier_frames} "
-            f"frames, elapsed={time.perf_counter() - started:.2f} s, "
-            f"mem usage={before_mem - after_mem:.2f} GB, avail mem={after_mem:.2f} GB."
-        )
 
     @torch.inference_mode()
     def run(
@@ -302,7 +267,7 @@ class PrefixCudaGraphRunner:
         ):
             destination.copy_(source)
         captured.graph.replay()
-        # note(ratish): the next replay of any tier overwrites the shared pool.
+        # note (ratish): the next replay of any solve graph overwrites the shared pool.
         generated = captured.output[:, :frame_count].clone()
         for index, row in enumerate(twin_caches):
             if index < row_count:

@@ -4,6 +4,7 @@
 import Foundation
 import CFNetwork
 import HuggingFace
+import OmniModelArtifacts
 
 enum MLXModelDownloadSupport {
     private static let modelEntryAllowedExtensions: Set<String> = ["safetensors", "json", "txt", "wav", "jinja", "model", "mvn"]
@@ -54,6 +55,14 @@ enum MLXModelDownloadSupport {
                 return "Invalid response from model server."
             }
         }
+    }
+
+    /// Weight files a model directory may hold. A Whisper checkpoint served by
+    /// the Omni runtime also loads from weights.npz, the only weights some
+    /// mlx-community repos ship.
+    nonisolated static func weightExtensions(for repo: String?) -> Set<String> {
+        guard let repo, OmniASRBackend.nativeModelKind(for: repo) == .whisper else { return ["safetensors"] }
+        return ["safetensors", "npz"]
     }
 
     struct ModelFileEntry: Hashable {
@@ -195,11 +204,12 @@ enum MLXModelDownloadSupport {
         }
 
         let json = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] ?? []
+        let allowedExtensions = modelEntryAllowedExtensions.union(weightExtensions(for: repo))
         return json.compactMap { item in
             guard (item["type"] as? String) == "file" else { return nil }
             let path = (item["path"] as? String) ?? ""
             let ext = path.split(separator: ".").last.map(String.init) ?? ""
-            guard modelEntryAllowedExtensions.contains(ext.lowercased()) else { return nil }
+            guard allowedExtensions.contains(ext.lowercased()) else { return nil }
             let size: Int64?
             if let raw = item["size"] as? Int {
                 size = Int64(raw)
@@ -254,20 +264,6 @@ enum MLXModelDownloadSupport {
         return .ready(bytes: size.bytes, text: size.text)
     }
 
-    @concurrent
-    nonisolated static func validateDownloadedModelInBackground(
-        at url: URL,
-        repo: String? = nil,
-        sizeState: MLXModelManager.ModelSizeState,
-        downloadSizeTolerance: Double,
-        fileManager: FileManager
-    ) async throws {
-        try await ModelDiskOperations.perform {
-            try validateDownloadedModel(at: url, repo: repo, sizeState: sizeState,
-                downloadSizeTolerance: downloadSizeTolerance, fileManager: fileManager)
-        }
-    }
-
     nonisolated static func validateDownloadedModel(
         at url: URL,
         repo: String? = nil,
@@ -277,7 +273,7 @@ enum MLXModelDownloadSupport {
     ) throws {
         let files = allFiles(at: url, fileManager: fileManager)
         let hasWeights = files.contains { file in
-            guard file.pathExtension.lowercased() == "safetensors" else { return false }
+            guard weightExtensions(for: repo).contains(file.pathExtension.lowercased()) else { return false }
             let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
             return size > 0
         }
@@ -291,8 +287,11 @@ enum MLXModelDownloadSupport {
             throw DownloadValidationError.missingFiles
         }
 
-        if !hasRequiredAuxiliaryFiles(at: url, repo: repo, files: files, fileManager: fileManager) {
+        if !hasRequiredAuxiliaryFiles(at: url, repo: repo, fileManager: fileManager) {
             throw DownloadValidationError.missingFiles
+        }
+        if repo == SileroVADModelSupport.repo {
+            try OmniModelArtifactValidation.validateSafetensorsDirectory(at: url)
         }
 
         if case .ready(let expectedBytes, _) = sizeState,
@@ -304,19 +303,6 @@ enum MLXModelDownloadSupport {
             if actualBytes < minimumBytes {
                 throw DownloadValidationError.sizeMismatch(expected: expectedBytes, actual: actualBytes)
             }
-        }
-    }
-
-    nonisolated static func clearDirectory(at url: URL, fileManager: FileManager) throws {
-        guard fileManager.fileExists(atPath: url.path) else { return }
-        do {
-            try fileManager.removeItem(at: url)
-        } catch {
-            let contents = try fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
-            for item in contents {
-                try? fileManager.removeItem(at: item)
-            }
-            try fileManager.removeItem(at: url)
         }
     }
 
@@ -341,7 +327,7 @@ enum MLXModelDownloadSupport {
 
         let files = allFiles(at: directory, fileManager: fileManager)
         let hasWeights = files.contains { file in
-            guard file.pathExtension.lowercased() == "safetensors" else { return false }
+            guard weightExtensions(for: repo).contains(file.pathExtension.lowercased()) else { return false }
             let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
             return size > 0
         }
@@ -356,7 +342,6 @@ enum MLXModelDownloadSupport {
         return hasWeights && ModelWeightFileValidation.hasCompleteIndex(in: directory) && hasRequiredAuxiliaryFiles(
             at: directory,
             repo: repo,
-            files: files,
             fileManager: fileManager
         )
     }
@@ -444,7 +429,6 @@ enum MLXModelDownloadSupport {
     private nonisolated static func hasRequiredAuxiliaryFiles(
         at directory: URL,
         repo: String?,
-        files _: [URL],
         fileManager: FileManager
     ) -> Bool {
         switch resolvedModelType(at: directory, repo: repo, fileManager: fileManager) {
