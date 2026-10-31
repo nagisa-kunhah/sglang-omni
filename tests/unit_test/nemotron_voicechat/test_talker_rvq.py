@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Talker RVQ code generation runs on a schedule precomputed at load time."""
 
+from contextlib import nullcontext
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -181,3 +184,45 @@ def test_graph_replay_does_not_sync_with_host():
 
     assert codes_TQ.shape == (1, NUM_QUANTIZERS)
     assert not codes_TQ.is_inference()
+
+
+def test_graph_initialization_uses_tensor_device_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    talker = make_talker()
+    mog_head = make_mog_head()
+    device = talker.rvq_embs.device
+    device_module = Mock()
+    device_module.stream.side_effect = lambda stream: nullcontext()
+    resolve_device_module = Mock(return_value=device_module)
+    monkeypatch.setattr(torch, "get_device_module", resolve_device_module)
+    for stream_api in ("Stream", "current_stream", "stream"):
+        monkeypatch.setattr(
+            torch.cuda,
+            stream_api,
+            Mock(side_effect=AssertionError("CPU tensors must not use CUDA streams")),
+        )
+    graph = Mock()
+    backend = Mock()
+    backend.capture.side_effect = lambda **parameters: nullcontext(graph)
+
+    generator = GraphCodeGenerator(
+        talker,
+        mog_head,
+        backend=backend,
+        level_schedule=talker.build_level_schedule(8, 2.0, device),
+        top_p=TOP_P,
+        noise_scale=1.0,
+    )
+    codes = generator(torch.randn(1, HIDDEN_SIZE))
+
+    resolve_device_module.assert_called_once_with(device)
+    device_module.Stream.assert_called_once_with(device=device)
+    device_module.current_stream.assert_called_once_with(device)
+    device_module.stream.assert_called_once_with(device_module.Stream.return_value)
+    assert (
+        backend.capture.call_args.kwargs["stream"] is device_module.Stream.return_value
+    )
+    graph.replay.assert_called_once_with()
+    assert codes.shape == (1, NUM_QUANTIZERS)
+    assert not codes.is_inference()

@@ -245,6 +245,7 @@ class GraphCodeGenerator:
         noise_scale: float,
     ) -> None:
         device = talker.rvq_embs.device
+        device_module = torch.get_device_module(device)
         self.hidden_input = torch.zeros(
             1, talker.embed_code.out_features, dtype=torch.float32, device=device
         )
@@ -258,11 +259,11 @@ class GraphCodeGenerator:
                 noise_scale=noise_scale,
             )
 
-        capture_stream = torch.cuda.Stream(device=device)
-        current_stream = torch.cuda.current_stream(device)
+        capture_stream = device_module.Stream(device=device)
+        current_stream = device_module.current_stream(device)
         capture_stream.wait_stream(current_stream)
         with torch.inference_mode():
-            with torch.cuda.stream(capture_stream):
+            with device_module.stream(capture_stream):
                 for iteration in range(GRAPH_WARMUP_STEPS):
                     generate()
             current_stream.wait_stream(capture_stream)
